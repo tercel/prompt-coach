@@ -138,7 +138,10 @@ SYSTEM_TEMPLATE = (
     "context. It may rely on established context and need not restate it. Preserve "
     "the user's intent; never invent requirements they did not state.\n"
     "   - guidance: ONE short sentence written in {native} teaching the single most "
-    "useful improvement.\n"
+    "useful improvement. Identify which ONE element is missing and name it "
+    "explicitly — choose from: a file/location path, an error message or symptom, "
+    "a success criterion (what 'done' looks like), or an implementation approach "
+    "(which method/library). Teach that specific gap, not a generic 'be clearer'.\n"
     "   If already strong, set has_issues=false, improved=\"\", guidance=\"\".\n\n"
     "Be concise. Never answer or execute the prompt — only analyze it."
 )

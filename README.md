@@ -80,6 +80,40 @@ Both platforms share the same `hooks/hooks.json` and `scripts/coach.py`: Claude
 Code discovers the hook through `.claude-plugin/plugin.json`, Codex through the
 `hooks` field in `.codex-plugin/plugin.json`.
 
+### Plugin install vs. manual wiring
+
+**Prefer the plugin install above.** The platform auto-detection depends on it:
+`COACH_PLATFORM=auto` reads `CLAUDE_PLUGIN_ROOT` / `PLUGIN_ROOT`, and those are
+set **only** by the plugin system. Installed as a plugin, Claude Code and Codex
+each detect their own platform and pick the right backend automatically, share a
+single checkout across both agents, get Codex's `/hooks` trust flow, and stay
+consistent across the terminal CLI and the desktop app.
+
+Wire the hook by hand in `~/.claude/settings.json` only when you are actively
+editing `scripts/coach.py` and want changes to take effect without reinstalling.
+In that case point the `command` at the working copy with an absolute path —
+**and set `COACH_PLATFORM=claude` explicitly**, because a manual hook has no
+`CLAUDE_PLUGIN_ROOT`, so detection would otherwise fall back to Codex:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/prompt-dual-coach/scripts/coach.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "env": { "COACH_PLATFORM": "claude" }
+}
+```
+
 ## Configure
 
 | Variable | Default | Meaning |
