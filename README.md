@@ -1,193 +1,156 @@
 # prompt-dual-coach
 
-A Claude Code plugin (a `UserPromptSubmit` hook) that coaches **two axes on every
-prompt you submit**:
+A shared Claude Code and Codex `UserPromptSubmit` plugin that coaches:
 
-1. **Prompt quality** — rewrites your prompt into a clearer instruction for a
-   coding assistant, plus one teaching tip (missing file paths, success
-   criteria, constraints…).
-2. **Target language** — corrects your expression in your chosen target language
-   (not just English): concrete `original → fix (why)` corrections **and** a
-   fully rewritten, natural version.
+1. **Prompt quality**: rewrites prompts into clearer coding instructions.
+2. **Target language**: identifies expression issues and provides a natural
+   rewrite in the language being practiced.
 
-It is a **prototype of the "brain"** for a future real-time product (terminal
-split-pane / floating panel). The analysis logic here (`scripts/coach.py`) is the
-reusable core; only the delivery shell changes later.
+The same analysis core, Hook configuration, and environment variables work in
+both agents. Clean prompts and backend failures pass through silently.
 
-> Why this exists: existing tools tend to do one or the other — fix your
-> language, or improve your prompt. This fuses both at submit time, and validates
-> that combined loop cheaply.
+## Supported platforms and backends
 
-## Requirements
+| Hook platform | Preferred CLI | API fallback |
+|---|---|---|
+| Claude Code | `claude -p` | Anthropic SDK with `ANTHROPIC_API_KEY` |
+| Codex | `codex exec` | OpenAI SDK with `OPENAI_API_KEY` |
 
-- Claude Code (recent version with plugin + hooks support)
-- Python 3.8+
-- A backend (pick one — **CLI is the zero-config default**):
-  - **CLI (default):** the `claude` command on your PATH. No pip install, no
-    separate API key — it reuses your Claude Code auth.
-  - **API:** `pip install anthropic` + `ANTHROPIC_API_KEY`.
+`COACH_BACKEND=auto` and `COACH_PLATFORM=auto` are the defaults. During a Hook
+run, the plugin detects the platform from its plugin-root environment variable:
 
-With no usable backend the hook **no-ops silently** — it never blocks your
-workflow.
+- `CLAUDE_PLUGIN_ROOT` selects Claude Code.
+- `PLUGIN_ROOT` selects Codex.
+- Standalone `--dry-run` defaults to Codex; set `COACH_PLATFORM=claude` to test
+  the Claude path.
 
-## Backends
-
-Set `COACH_BACKEND`:
-
-| Value | Behavior |
-|---|---|
-| `auto` (default) | Use the `claude` CLI if found, else fall back to the Anthropic SDK + API key. |
-| `cli` | Force the `claude` CLI (`claude -p --output-format json`). |
-| `api` | Force the Anthropic Python SDK (needs `pip install anthropic` + `ANTHROPIC_API_KEY`). |
-
-The CLI backend spawns `claude -p`, which itself fires `UserPromptSubmit`. To
-avoid infinite recursion the hook sets `COACH_NESTED=1` on the child process, and
-the nested invocation exits immediately. (The CLI path has no JSON-schema
-enforcement, so output is parsed tolerantly — fences/preamble are stripped; the
-API path additionally enforces the schema via `output_config.format`.)
+The selected platform's CLI is tried first. If it fails and the corresponding
+API key is available, the plugin falls back to that platform's API.
 
 ## Install
 
-From a local checkout (adjust the path to wherever you cloned this):
+### Claude Code
 
-```
+The Claude plugin entry point is `.claude-plugin/plugin.json`:
+
+```text
 /plugin marketplace add /absolute/path/to/prompt-dual-coach
 /plugin install prompt-dual-coach
 ```
 
-Restart Claude Code so the hook registers. (Plugin packaging may need a small
-tweak to match your Claude Code version's marketplace format — the load-bearing
-file is `scripts/coach.py`; you can also wire it directly in `settings.json`, see
-below.)
+Restart Claude Code after installation.
 
-### Or wire it manually (no marketplace)
+#### Claude desktop app (Code mode)
 
-Add to `~/.claude/settings.json`:
+Plugins and hooks run in the desktop app's Code mode too — not just the terminal
+CLI. The catch is the hook subprocess's environment: the desktop app is a GUI
+process, so its `PATH` is usually a minimal one that does **not** include where
+`claude` is installed (e.g. `~/.local/bin`). When `claude` isn't found, the CLI
+backend is unavailable and the hook silently no-ops unless an API key is set.
+
+To make it robust regardless of surface, add an `env` block to
+`~/.claude/settings.json` — Claude Code injects it into the session and hook
+subprocesses, independent of the GUI's `PATH`:
 
 ```json
 {
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          { "type": "command", "command": "python3 /absolute/path/to/prompt-dual-coach/scripts/coach.py", "timeout": 30 }
-        ]
-      }
-    ]
+  "env": {
+    "ANTHROPIC_API_KEY": "sk-ant-...",
+    "COACH_CLAUDE_BIN": "/Users/you/.local/bin/claude"
   }
 }
 ```
 
-## Configure
+- `COACH_CLAUDE_BIN` (absolute path, from `which claude`) keeps the zero-cost CLI
+  backend working — it reuses your Claude auth, no API billing.
+- `ANTHROPIC_API_KEY` is the fallback so the hook still runs if the CLI binary
+  can't be located. Setting both gives CLI-first with API as a safety net.
 
-All via environment variables:
+In the terminal CLI your shell `PATH` already exposes `claude`, so neither is
+required there.
+
+### Codex
+
+The Codex plugin entry point is `.codex-plugin/plugin.json`, which points Codex
+at the hook via its `"hooks": "./hooks/hooks.json"` field. Add this checkout to a
+configured Codex marketplace, install `prompt-dual-coach`, restart Codex, then
+review and trust the bundled Hook using `/hooks`.
+
+Both platforms share the same `hooks/hooks.json` and `scripts/coach.py`: Claude
+Code discovers the hook through `.claude-plugin/plugin.json`, Codex through the
+`hooks` field in `.codex-plugin/plugin.json`.
+
+## Configure
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `COACH_BACKEND` | `auto` | `auto` \| `cli` \| `api` (see Backends). |
-| `COACH_CLAUDE_BIN` | (PATH) | Path to the `claude` binary if not on PATH. |
-| `ANTHROPIC_API_KEY` | — | Required only for the `api` backend / fallback. |
-| `COACH_TARGET_LANG` | `English` | The language you want to improve (any language). |
-| `COACH_NATIVE_LANG` | auto | Your native language (explanations are written in it). Auto-detected from your locale (`LANG`/`LC_*`); fallback `English`. Set to override. |
+| `COACH_PLATFORM` | `auto` | `auto`, `claude`, or `codex`. |
+| `COACH_BACKEND` | `auto` | `auto`, `cli`, `api`, `claude`, `anthropic`, `codex`, or `openai`. |
+| `COACH_CLAUDE_BIN` | PATH lookup | Explicit Claude CLI path. |
+| `COACH_CODEX_BIN` | PATH lookup | Explicit Codex CLI path. |
+| `ANTHROPIC_API_KEY` | unset | Enables Anthropic API fallback. |
+| `OPENAI_API_KEY` | unset | Enables OpenAI API fallback. |
+| `COACH_MODEL` | unset | Override every backend model. |
+| `COACH_ANTHROPIC_MODEL` | `claude-haiku-4-5` | Claude CLI and Anthropic API model. |
+| `COACH_CLI_MODEL` | agent default | Codex CLI model. |
+| `COACH_API_MODEL` | `gpt-5-mini` | OpenAI API model. |
+| `COACH_TARGET_LANG` | `English` | Language being practiced. |
+| `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
+| `COACH_LEVEL` | `Advanced` | Feedback depth. |
+| `COACH_MODE` | `annotate` | `annotate` or `block`. |
+| `COACH_MIN_PROMPT_CHARS` | `12` | Skip shorter prompts. |
+| `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
+| `COACH_CONTEXT_CHARS` | `2000` | Maximum rendered context characters. |
+| `COACH_TIMEOUT` | `25` | Backend timeout in seconds. |
+| `COACH_DISABLE` | unset | Set truthy to disable. |
+| `COACH_DEBUG` | unset | Set truthy to print errors. |
 
-> If you **explicitly** set `COACH_NATIVE_LANG` equal to `COACH_TARGET_LANG`
-> (a native practicing their own language), the language axis is turned off and
-> you get prompt-quality coaching only. If they only match because native was
-> *auto-detected* (e.g. an English-locale machine), the language axis stays on —
-> for a true native it simply finds nothing to fix.
-| `COACH_LEVEL` | `Advanced` | Free text; tunes feedback depth. Recommended: `Beginner` \| `Intermediate` \| `Advanced` (or CEFR `A1`–`C2`). |
-| `COACH_MODEL` | `claude-haiku-4-5` | Fast/cheap by design; runs on every prompt. |
-| `COACH_MODE` | `annotate` | `annotate` (non-blocking) or `block` (see below). |
-| `COACH_MIN_PROMPT_CHARS` | `12` | Skip prompts shorter than this. |
-| `COACH_CONTEXT_MESSAGES` | `6` | Recent conversation turns fed to the model for context. `0` = isolate. |
-| `COACH_CONTEXT_CHARS` | `2000` | Max characters of rendered context. |
-| `COACH_TIMEOUT` | `25` | Backend timeout in seconds (hook timeout is 30). |
-| `COACH_DISABLE` | — | Set truthy to disable without uninstalling. |
-| `COACH_DEBUG` | — | Set truthy to print errors to stderr. |
+`cli` and `api` are platform-aware aliases. Explicit backend names bypass
+platform detection:
 
-Example (improving English, default CLI backend — no key needed):
-
-```
-export COACH_TARGET_LANG=English
-# COACH_NATIVE_LANG is auto-detected from your locale (e.g. LANG=zh_CN.UTF-8 -> Chinese);
-#   set it only to override.
-export COACH_LEVEL=Advanced      # or Beginner / Intermediate, or CEFR A1-C2
-# COACH_BACKEND defaults to auto -> uses the `claude` CLI if present
-```
-
-## Two delivery modes
-
-A `UserPromptSubmit` hook has **no direct stdout→user channel**, so coaching is
-delivered one of two ways:
-
-- **`annotate` (default, non-blocking):** injects the coaching as
-  `additionalContext` instructing Claude to show the block at the top of its
-  reply and answer the *improved* prompt. You keep working; you see coaching +
-  still get your answer.
-- **`block` (strict learning loop):** surfaces the coaching and **blocks** the
-  prompt (exit 2) so you consciously resubmit the improved version. More
-  friction, stronger learning.
-
-Clean prompts (no issues on either axis) pass through silently.
-
-## How it works
-
-```
-UserPromptSubmit hook (coach.py)
-  -> COACH_NESTED set? exit (recursion guard for the CLI backend)
-  -> read the submitted prompt + transcript_path
-  -> pre-filter (skip slash commands / very short input)
-  -> read recent turns from the session transcript (conversation context)
-  -> one fast Claude call (CLI `claude -p`, or Anthropic SDK) -> JSON:
-       {language:{corrections, improved}, prompt:{improved, guidance}}
-  -> render a dual-axis coaching block
-  -> annotate (inject context) OR block (exit 2)
+```bash
+COACH_BACKEND=claude    # force Claude CLI
+COACH_BACKEND=anthropic # force Anthropic API
+COACH_BACKEND=codex     # force Codex CLI
+COACH_BACKEND=openai    # force OpenAI API
 ```
 
-**Context-aware.** The hook reads the last few turns from the session's
-transcript (`transcript_path`) and judges your new prompt *in context* — so a
-terse follow-up that is clear given the conversation is not flagged as "vague".
-The language axis still evaluates the new prompt's expression. Set
-`COACH_CONTEXT_MESSAGES=0` to analyze each prompt in isolation.
+If `COACH_NATIVE_LANG` explicitly equals `COACH_TARGET_LANG`, only prompt
+quality coaching runs.
 
-The API backend uses the Messages API with `output_config.format` (JSON schema)
-for guaranteed-valid JSON; the CLI backend parses the model's JSON tolerantly.
+## Delivery modes
 
-## Try it locally (no hook wiring)
+- **`annotate`**: inject coaching as additional developer context, then answer
+  the improved request.
+- **`block`**: reject the prompt with exit code 2 and require resubmission.
 
-See the actual coaching output against any prompt, using your configured backend:
+## Try locally
 
+```bash
+# Auto defaults to Codex outside a Hook.
+python3 scripts/coach.py --dry-run "i want fix login bug when token expire"
+
+# Test Claude auto-selection.
+COACH_PLATFORM=claude python3 scripts/coach.py --dry-run "review this prompt"
+
+# Force a specific backend.
+COACH_BACKEND=openai python3 scripts/coach.py --dry-run "review this prompt"
+COACH_BACKEND=anthropic python3 scripts/coach.py --dry-run "review this prompt"
 ```
-python3 scripts/coach.py --dry-run "i want fix the login bug, it not work when token expire"
-# or pipe it:
-echo "now do the same for the logout flow" | python3 scripts/coach.py --dry-run
-```
 
-It prints the dual-axis coaching block (or "looks good" if there's nothing to
-fix). This is the fastest way to judge the feedback quality before wiring the
-hook into Claude Code. (Dry-run analyzes the prompt without conversation
-context.)
+## Develop and test
 
-## Develop / test
-
-Pure helpers are unit-tested with no network or SDK dependency:
-
-```
+```bash
 python3 tests/test_coach.py -v
 ```
 
-18 tests cover pre-filtering, JSON parsing, coaching formatting, and both
-delivery modes.
+Unit tests do not call external models.
 
-## Limitations (honest)
+## Limitations
 
-- **Post-submit, not as-you-type.** Hooks fire after you press Enter. True
-  live "while typing" feedback needs a different shell (terminal compose pane /
-  PTY wrapper / floating panel) — that's the next phase. This brain is portable
-  to all of them.
-- **Annotate mode relies on Claude rendering the block.** Usually fine; `block`
-  mode is deterministic if you want guaranteed visibility.
-- **A model call per non-trivial prompt** costs a little latency + tokens
-  (Haiku keeps it cheap). Pre-filters and the "silent when clean" path keep it
-  out of the way.
-- This is a **prototype to validate the feedback**, not the final product.
+- Coaching runs after prompt submission, not while typing.
+- Annotate mode relies on the active agent following the injected display
+  instruction.
+- Every non-trivial prompt creates an additional model call.
+- Transcript parsing is best-effort because agent transcript formats are not
+  stable public APIs.

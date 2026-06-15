@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Prompt Dual-Coach — a Claude Code UserPromptSubmit hook.
+"""Prompt Dual-Coach — a Claude Code and Codex UserPromptSubmit hook.
 
-On every prompt you submit, this hook asks a fast Claude model to analyze two
+On every prompt you submit, this hook asks a fast OpenAI model to analyze two
 independent axes and feed coaching back to you:
 
   1. prompt  — the prompt as an instruction to a coding assistant
@@ -11,28 +11,31 @@ independent axes and feed coaching back to you:
                Returns concrete corrections (original -> fix + why) AND a fully
                rewritten, natural version.
 
-This is the reusable "brain". The delivery shell here is a Claude Code hook;
+This is the reusable "brain". The delivery shell supports Claude Code and Codex;
 the same analysis logic is meant to be reused later behind a terminal split-pane
 or a floating panel.
 
 Delivery modes (env COACH_MODE):
   - "annotate" (default): non-blocking. Injects the coaching as additionalContext
-    so Claude shows it to you and answers the improved prompt.
+    so the active coding agent shows it and answers the improved prompt.
   - "block": blocking. Surfaces the coaching and blocks the prompt so you
     consciously resubmit the improved version (a stricter learning loop).
 
 Backends (env COACH_BACKEND):
-  - "auto" (default): use the `claude` CLI if available (no pip, no separate API
-    key — reuses your Claude Code auth), else fall back to the Anthropic SDK.
-  - "cli": force the `claude` CLI.
-  - "api": force the Anthropic Python SDK (needs `pip install anthropic` + key).
+  - "auto" (default): use the current hook platform's CLI, then its API.
+  - "cli" / "api": force the current hook platform's CLI / API.
+  - "codex" / "openai": force Codex CLI / OpenAI API.
+  - "claude" / "anthropic": force Claude CLI / Anthropic API.
 
 Configuration (environment variables):
   COACH_BACKEND            "auto" (default) | "cli" | "api"
+                           | "codex" | "openai" | "claude" | "anthropic"
+  COACH_PLATFORM           "auto" (default) | "codex" | "claude"
+  COACH_CODEX_BIN          path to the `codex` binary (default: found on PATH)
   COACH_CLAUDE_BIN         path to the `claude` binary (default: found on PATH)
-  COACH_CLI_FLAGS          extra space-separated flags for the `claude` CLI call
-                           (e.g. "--bare") — for experimenting with faster boot
-  ANTHROPIC_API_KEY        required only for the "api" backend / fallback
+  COACH_CLI_FLAGS          extra space-separated flags for `codex exec`
+  OPENAI_API_KEY           required only for the "api" backend / fallback
+  ANTHROPIC_API_KEY        enables the Anthropic API backend / fallback
   COACH_TARGET_LANG        target language to coach (default: "English")
   COACH_NATIVE_LANG        your native language, used for explanations
                            (default: auto-detected from locale, e.g. LANG;
@@ -40,7 +43,11 @@ Configuration (environment variables):
   COACH_LEVEL              proficiency — tunes feedback depth. Free text;
                            recommended Beginner | Intermediate | Advanced
                            (or CEFR A1-C2). (default: "Advanced")
-  COACH_MODEL              Claude model id (default: "claude-haiku-4-5")
+  COACH_MODEL              override both backend models (default: CLI config /
+                           "gpt-5-mini" for API)
+  COACH_CLI_MODEL          override only the Codex CLI model
+  COACH_API_MODEL          override only the OpenAI API model
+  COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
   COACH_MODE               "annotate" (default) | "block"
   COACH_MIN_PROMPT_CHARS   skip prompts shorter than this (default: 12)
   COACH_CONTEXT_MESSAGES   recent turns of conversation context to include
@@ -50,8 +57,8 @@ Configuration (environment variables):
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
 
-Re-entrancy: the "cli" backend spawns `claude -p`, which itself fires
-UserPromptSubmit and would re-invoke this hook. We set COACH_NESTED=1 on the
+Re-entrancy: the CLI backend's nested `codex exec` / `claude -p` call could
+re-fire UserPromptSubmit and re-invoke this hook. We set COACH_NESTED=1 on the
 child so the nested invocation exits immediately — no recursion.
 
 Design rule: this hook must NEVER break your workflow. Any error (missing
@@ -62,9 +69,10 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 
 # ---------------------------------------------------------------------------
-# Analysis contract (structured output schema enforced by the Messages API)
+# Analysis contract (structured output schema enforced by both backends)
 # ---------------------------------------------------------------------------
 
 ANALYSIS_SCHEMA = {
@@ -324,15 +332,34 @@ def detect_native_language(env, default="English"):
     return default
 
 
+def detect_platform(env):
+    """Detect the active hook platform, defaulting to Codex for standalone use."""
+    explicit = (env.get("COACH_PLATFORM") or "").strip().lower()
+    if explicit in ("codex", "claude"):
+        return explicit
+    # Codex injects BOTH PLUGIN_ROOT and CLAUDE_PLUGIN_ROOT (the latter for
+    # claude-ecosystem compat), whereas Claude Code sets only CLAUDE_PLUGIN_ROOT.
+    # So PLUGIN_ROOT is the unambiguous Codex signal and must be checked first.
+    if env.get("PLUGIN_ROOT"):
+        return "codex"
+    if env.get("CLAUDE_PLUGIN_ROOT"):
+        return "claude"
+    return "codex"
+
+
 def load_config(env):
     """Build a config dict from an environment-like mapping."""
     try:
         min_chars = int(env.get("COACH_MIN_PROMPT_CHARS", "12") or "12")
     except (TypeError, ValueError):
         min_chars = 12
+    codex_bin = env.get("COACH_CODEX_BIN") or shutil.which(
+        "codex", path=env.get("PATH")
+    )
     claude_bin = env.get("COACH_CLAUDE_BIN") or shutil.which(
         "claude", path=env.get("PATH")
     )
+    shared_model = (env.get("COACH_MODEL") or "").strip()
     target = env.get("COACH_TARGET_LANG", "English")
     native_explicit = env.get("COACH_NATIVE_LANG")
     native = native_explicit or detect_native_language(env)
@@ -347,12 +374,18 @@ def load_config(env):
     )
     return {
         "backend": (env.get("COACH_BACKEND", "auto") or "auto").strip().lower(),
+        "platform": detect_platform(env),
+        "codex_bin": codex_bin,
         "claude_bin": claude_bin,
         "target": target,
         "native": native,
         "coach_language": coach_language,
         "level": env.get("COACH_LEVEL", "Advanced"),
-        "model": env.get("COACH_MODEL", "claude-haiku-4-5"),
+        "cli_model": (env.get("COACH_CLI_MODEL") or shared_model).strip(),
+        "api_model": (env.get("COACH_API_MODEL") or shared_model or "gpt-5-mini").strip(),
+        "anthropic_model": (
+            env.get("COACH_ANTHROPIC_MODEL") or shared_model or "claude-haiku-4-5"
+        ).strip(),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
         "min_chars": min_chars,
         "context_messages": _to_int(env.get("COACH_CONTEXT_MESSAGES"), 6),
@@ -360,18 +393,32 @@ def load_config(env):
         "timeout": _to_float(env.get("COACH_TIMEOUT"), 25.0),
         "disabled": _flag(env.get("COACH_DISABLE", "")),
         "debug": _flag(env.get("COACH_DEBUG", "")),
-        "has_api_key": bool(env.get("ANTHROPIC_API_KEY")),
+        "has_api_key": bool(env.get("OPENAI_API_KEY")),
+        "has_anthropic_key": bool(env.get("ANTHROPIC_API_KEY")),
     }
 
 
 def backend_available(cfg):
     """True if the configured backend can actually run."""
     backend = cfg["backend"]
+    platform = cfg["platform"]
     if backend == "cli":
-        return bool(cfg["claude_bin"])
+        return bool(cfg["claude_bin"] if platform == "claude" else cfg["codex_bin"])
     if backend == "api":
+        return bool(
+            cfg["has_anthropic_key"] if platform == "claude" else cfg["has_api_key"]
+        )
+    if backend == "codex":
+        return bool(cfg["codex_bin"])
+    if backend == "openai":
         return bool(cfg["has_api_key"])
-    return bool(cfg["claude_bin"] or cfg["has_api_key"])  # auto
+    if backend == "claude":
+        return bool(cfg["claude_bin"])
+    if backend == "anthropic":
+        return bool(cfg["has_anthropic_key"])
+    if platform == "claude":
+        return bool(cfg["claude_bin"] or cfg["has_anthropic_key"])
+    return bool(cfg["codex_bin"] or cfg["has_api_key"])
 
 
 def extract_json_text(text):
@@ -458,7 +505,7 @@ def format_coaching(analysis, cfg):
 
 
 def build_additional_context(analysis, cfg, block):
-    """Instruction injected into Claude's context for annotate mode."""
+    """Instruction injected into the active agent's context for annotate mode."""
     lines = [
         "[prompt-dual-coach] Coaching for the user, a %s speaker practicing %s (%s level)."
         % (cfg["native"], cfg["target"], cfg["level"]),
@@ -524,25 +571,94 @@ def gate_language(analysis, cfg):
 
 
 def _analyze_cli(prompt, cfg, context=""):
-    """Run analysis through the `claude` CLI (no SDK, no separate API key)."""
+    """Run analysis through `codex exec` using the user's existing Codex auth."""
+    import subprocess
+
+    with tempfile.TemporaryDirectory(prefix="prompt-dual-coach-") as tmpdir:
+        schema_path = os.path.join(tmpdir, "analysis-schema.json")
+        with open(schema_path, "w", encoding="utf-8") as schema:
+            json.dump(ANALYSIS_SCHEMA, schema)
+        # Capture ONLY the final agent message in a file. `codex exec` prints a
+        # chatty session log (preamble + reasoning) to stdout that can contain
+        # braces and corrupt JSON extraction; the last-message file is clean.
+        last_message_path = os.path.join(tmpdir, "last-message.txt")
+        cmd = [
+            cfg["codex_bin"], "exec",
+            "--ephemeral",
+            "--sandbox", "read-only",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--output-schema", schema_path,
+            "--output-last-message", last_message_path,
+        ]
+        if cfg["cli_model"]:
+            cmd += ["--model", cfg["cli_model"]]
+        extra = os.environ.get("COACH_CLI_FLAGS", "").split()
+        if extra:
+            cmd[2:2] = extra
+        cmd.append("-")
+        child_env = dict(os.environ)
+        child_env["COACH_NESTED"] = "1"
+        proc = subprocess.run(
+            cmd,
+            input=_system(cfg) + "\n\n" + _user_content(prompt, context),
+            capture_output=True,
+            text=True,
+            timeout=cfg["timeout"],
+            env=child_env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "codex CLI exit %d: %s"
+                % (
+                    proc.returncode,
+                    ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[:400],
+                )
+            )
+        try:
+            with open(last_message_path, encoding="utf-8") as last:
+                final = last.read()
+        except OSError:
+            final = ""
+    # Fall back to stdout if the last-message file was empty / not written.
+    return parse_analysis_text(extract_json_text(final or proc.stdout))
+
+
+def _analyze_api(prompt, cfg, context=""):
+    """Run analysis through the OpenAI Responses API (needs OPENAI_API_KEY)."""
+    from openai import OpenAI  # lazy: pure-function tests run without the SDK
+
+    client = OpenAI(timeout=cfg["timeout"])
+    resp = client.responses.create(
+        model=cfg["api_model"],
+        instructions=_system(cfg),
+        input=_user_content(prompt, context),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "prompt_dual_coach_analysis",
+                "strict": True,
+                "schema": ANALYSIS_SCHEMA,
+            }
+        },
+    )
+    return parse_analysis_text(extract_json_text(resp.output_text))
+
+
+def _analyze_claude_cli(prompt, cfg, context=""):
+    """Run analysis through Claude CLI using the user's existing Claude auth."""
     import subprocess
 
     cmd = [
         cfg["claude_bin"], "-p",
-        # Skip loading the user's MCP servers — they add large per-invocation boot
-        # latency and this is a pure text-analysis call that needs no tools.
         "--strict-mcp-config",
         "--output-format", "json",
-        "--model", cfg["model"],
+        "--model", cfg["anthropic_model"],
         "--append-system-prompt", _system(cfg),
     ]
-    # Optional escape hatch for experimenting with leaner-boot flags (e.g. --bare),
-    # space-separated, without editing this file.
-    extra = os.environ.get("COACH_CLI_FLAGS", "").split()
-    if extra:
-        cmd[2:2] = extra
     child_env = dict(os.environ)
-    child_env["COACH_NESTED"] = "1"  # break hook recursion in the nested run
+    child_env["COACH_NESTED"] = "1"
     proc = subprocess.run(
         cmd,
         input=_user_content(prompt, context),
@@ -553,7 +669,11 @@ def _analyze_cli(prompt, cfg, context=""):
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            "claude CLI exit %d: %s" % (proc.returncode, (proc.stderr or "").strip()[:200])
+            "claude CLI exit %d: %s"
+            % (
+                proc.returncode,
+                ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[:400],
+            )
         )
     envelope = json.loads(proc.stdout)
     if envelope.get("is_error"):
@@ -561,34 +681,59 @@ def _analyze_cli(prompt, cfg, context=""):
     return parse_analysis_text(extract_json_text(envelope.get("result", "")))
 
 
-def _analyze_api(prompt, cfg, context=""):
-    """Run analysis through the Anthropic Python SDK (needs ANTHROPIC_API_KEY)."""
-    import anthropic  # lazy: pure-function tests must run without the SDK installed
+def _analyze_anthropic_api(prompt, cfg, context=""):
+    """Run analysis through the Anthropic Messages API."""
+    import anthropic
 
     client = anthropic.Anthropic()
-    resp = client.with_options(timeout=cfg["timeout"]).messages.create(  # type: ignore[call-overload]
-        model=cfg["model"],
+    resp = client.with_options(timeout=cfg["timeout"]).messages.create(
+        model=cfg["anthropic_model"],
         max_tokens=1024,
         system=_system(cfg),
         messages=[{"role": "user", "content": _user_content(prompt, context)}],
-        # output_config.format forces schema-valid JSON (GA; Anthropic structured outputs).
         output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
     )
     text = next(
-        (b.text for b in resp.content if getattr(b, "type", None) == "text"), ""
+        (block.text for block in resp.content if getattr(block, "type", None) == "text"),
+        "",
     )
     return parse_analysis_text(extract_json_text(text))
 
 
 def analyze(prompt, cfg, context=""):
-    """Dispatch to the configured backend (auto = CLI first, API fallback)."""
+    """Dispatch to an explicit backend or the active platform's CLI/API pair."""
     backend = cfg["backend"]
+    platform = cfg["platform"]
     if backend == "api":
-        return _analyze_api(prompt, cfg, context)
+        return (
+            _analyze_anthropic_api(prompt, cfg, context)
+            if platform == "claude"
+            else _analyze_api(prompt, cfg, context)
+        )
     if backend == "cli":
+        return (
+            _analyze_claude_cli(prompt, cfg, context)
+            if platform == "claude"
+            else _analyze_cli(prompt, cfg, context)
+        )
+    if backend == "codex":
         return _analyze_cli(prompt, cfg, context)
-    # auto: prefer the CLI (zero-config), fall back to the API key if present
-    if cfg["claude_bin"]:
+    if backend == "openai":
+        return _analyze_api(prompt, cfg, context)
+    if backend == "claude":
+        return _analyze_claude_cli(prompt, cfg, context)
+    if backend == "anthropic":
+        return _analyze_anthropic_api(prompt, cfg, context)
+    if platform == "claude":
+        if cfg["claude_bin"]:
+            try:
+                return _analyze_claude_cli(prompt, cfg, context)
+            except Exception:
+                if cfg["has_anthropic_key"]:
+                    return _analyze_anthropic_api(prompt, cfg, context)
+                raise
+        return _analyze_anthropic_api(prompt, cfg, context)
+    if cfg["codex_bin"]:
         try:
             return _analyze_cli(prompt, cfg, context)
         except Exception:
@@ -617,7 +762,8 @@ def dry_run(argv):
     cfg = load_config(os.environ)
     if not backend_available(cfg):
         sys.stderr.write(
-            "No backend available: install the `claude` CLI or set ANTHROPIC_API_KEY.\n"
+            "No backend available for %s: install its CLI or configure its API key.\n"
+            % cfg["platform"]
         )
         return 1
     try:
@@ -637,7 +783,7 @@ def main():
     if "--dry-run" in sys.argv[1:]:
         sys.exit(dry_run(sys.argv[1:]))
 
-    # Re-entrancy guard: we are inside our own nested `claude -p` call.
+    # Re-entrancy guard: we are inside our own nested `codex exec` call.
     if _flag(os.environ.get("COACH_NESTED", "")):
         sys.exit(0)
 
