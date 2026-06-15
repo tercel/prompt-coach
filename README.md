@@ -125,14 +125,14 @@ In that case point the `command` at the working copy with an absolute path —
 | `ANTHROPIC_API_KEY` | unset | Enables Anthropic API fallback. |
 | `OPENAI_API_KEY` | unset | Enables OpenAI API fallback. |
 | `COACH_MODEL` | unset | Override every backend model. |
-| `COACH_ANTHROPIC_MODEL` | `claude-haiku-4-5` | Claude CLI and Anthropic API model. |
+| `COACH_ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Claude CLI and Anthropic API model. |
 | `COACH_CLI_MODEL` | agent default | Codex CLI model. |
-| `COACH_API_MODEL` | `gpt-5-mini` | OpenAI API model. |
+| `COACH_API_MODEL` | `gpt-4o-mini` | OpenAI API model. |
 | `COACH_TARGET_LANG` | `English` | Language being practiced. |
 | `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
 | `COACH_LEVEL` | `Advanced` | Feedback depth. |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
-| `COACH_MIN_PROMPT_CHARS` | `12` | Skip shorter prompts. |
+| `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
 | `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
 | `COACH_CONTEXT_CHARS` | `2000` | Maximum rendered context characters. |
 | `COACH_TIMEOUT` | `25` | Backend timeout in seconds. |
@@ -151,6 +151,24 @@ COACH_BACKEND=openai    # force OpenAI API
 
 If `COACH_NATIVE_LANG` explicitly equals `COACH_TARGET_LANG`, only prompt
 quality coaching runs.
+
+## Which prompts get coached
+
+A cheap deterministic pre-filter runs before any model call. It skips only input
+that is unambiguously not worth coaching, so short-but-vague prompts still get
+caught:
+
+| Skipped (no model call) | Coached |
+|---|---|
+| Slash commands, `!shell` | `fix bug`, `review code`, `add tests` |
+| Bare answers / flow-control: `yes`, `ok`, `1`, `continue` | `make it better`, `optimize it` |
+| Dev command lines: `git push`, `npm install`, `cargo test` | `go implement the login feature` |
+| Context-rich phrases: `build it`, `run tests`, `do it` | any ≥2-word natural-language request |
+| Single tokens: `refactor`, `optimize` | |
+
+Everything that passes the filter goes to the model, which reads recent
+conversation and stays silent on context-clear follow-ups. `make`/`go` are
+treated as English words, not CLI commands, so `make it better` is coached.
 
 ## Delivery modes
 

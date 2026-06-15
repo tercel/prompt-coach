@@ -43,24 +43,52 @@ def make_analysis(lang_issues=True, prompt_issues=True):
 
 class TestShouldSkip(unittest.TestCase):
     def test_slash_command(self):
-        self.assertTrue(coach.should_skip("/help", 12))
+        self.assertTrue(coach.should_skip("/help", 6))
 
     def test_shell_passthrough(self):
-        self.assertTrue(coach.should_skip("!ls -la", 12))
+        self.assertTrue(coach.should_skip("!ls -la", 6))
 
     def test_empty(self):
-        self.assertTrue(coach.should_skip("   ", 12))
+        self.assertTrue(coach.should_skip("   ", 6))
 
     def test_none(self):
-        self.assertTrue(coach.should_skip(None, 12))
-
-    def test_too_short(self):
-        self.assertTrue(coach.should_skip("fix it", 12))
+        self.assertTrue(coach.should_skip(None, 6))
 
     def test_normal_prompt(self):
         self.assertFalse(
-            coach.should_skip("please refactor the auth module to use JWT", 12)
+            coach.should_skip("please refactor the auth module to use JWT", 6)
         )
+
+    def test_short_vague_multiword_is_coached(self):
+        # The whole point: short but genuinely vague requests must NOT be skipped.
+        for p in ("fix bug", "review code", "add tests", "add auth", "make it better"):
+            self.assertFalse(coach.should_skip(p, 6), p)
+
+    def test_single_token_is_skipped(self):
+        for p in ("yes", "ok", "continue", "commit", "optimize", "refactor", "build"):
+            self.assertTrue(coach.should_skip(p, 6), p)
+
+    def test_bare_answers_and_numbers_skipped(self):
+        for p in ("Yes.", "no!", "1", "2", "  OK  ", "lgtm"):
+            self.assertTrue(coach.should_skip(p, 6), p)
+
+    def test_context_rich_phrases_skipped(self):
+        for p in ("build it", "test it", "run tests", "commit and push", "do it"):
+            self.assertTrue(coach.should_skip(p, 6), p)
+
+    def test_dev_command_lines_skipped(self):
+        for p in ("git commit -m 'fix'", "npm install react", "docker build .",
+                  "cargo test --all"):
+            self.assertTrue(coach.should_skip(p, 6), p)
+
+    def test_ambiguous_prefixes_not_treated_as_commands(self):
+        # "make"/"go" are English words too — these must be coached, not skipped.
+        for p in ("make it better", "go implement the login feature"):
+            self.assertFalse(coach.should_skip(p, 6), p)
+
+    def test_ultra_short_multiword_floor(self):
+        self.assertTrue(coach.should_skip("a b", 6))      # junk below floor
+        self.assertTrue(coach.should_skip("go on", 6))    # 5 chars < 6
 
 
 class TestParse(unittest.TestCase):
@@ -131,9 +159,9 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg["target"], "English")
         self.assertEqual(cfg["native"], "English")
         self.assertEqual(cfg["platform"], "codex")
-        self.assertEqual(cfg["api_model"], "gpt-5-mini")
+        self.assertEqual(cfg["api_model"], "gpt-4o-mini")
         self.assertEqual(cfg["cli_model"], "")
-        self.assertEqual(cfg["anthropic_model"], "claude-haiku-4-5")
+        self.assertEqual(cfg["anthropic_model"], "claude-haiku-4-5-20251001")
         self.assertEqual(cfg["mode"], "annotate")
         self.assertEqual(cfg["backend"], "auto")
         self.assertFalse(cfg["has_api_key"])
@@ -196,9 +224,12 @@ class TestLoadConfig(unittest.TestCase):
         self.assertTrue(cfg["has_api_key"])
         self.assertTrue(cfg["has_anthropic_key"])
 
+    def test_min_chars_default(self):
+        self.assertEqual(coach.load_config({})["min_chars"], 6)
+
     def test_bad_min_chars_falls_back(self):
         cfg = coach.load_config({"COACH_MIN_PROMPT_CHARS": "abc"})
-        self.assertEqual(cfg["min_chars"], 12)
+        self.assertEqual(cfg["min_chars"], 6)
 
     def test_bad_timeout_falls_back(self):
         cfg = coach.load_config({"COACH_TIMEOUT": "soon"})
@@ -299,7 +330,7 @@ class TestCodexCliBackend(unittest.TestCase):
     def _run_writing_last_message(self, message):
         """subprocess.run stub that writes `message` to --output-last-message."""
 
-        def _side_effect(cmd, **kwargs):
+        def _side_effect(cmd, **_kwargs):
             path = cmd[cmd.index("--output-last-message") + 1]
             with open(path, "w", encoding="utf-8") as out:
                 out.write(message)
@@ -329,7 +360,7 @@ class TestCodexCliBackend(unittest.TestCase):
         # braces) must not corrupt parsing.
         cfg = coach.load_config({"PATH": "", "COACH_CODEX_BIN": "/bin/codex"})
 
-        def _side_effect(cmd, **kwargs):
+        def _side_effect(cmd, **_kwargs):
             path = cmd[cmd.index("--output-last-message") + 1]
             with open(path, "w", encoding="utf-8") as out:
                 out.write(make_analysis_text())
@@ -399,7 +430,10 @@ class TestAnthropicApiBackend(unittest.TestCase):
                 "COACH_ANTHROPIC_MODEL": "claude-test",
             }
         )
-        response = mock.Mock(content=[mock.Mock(type="text", text=make_analysis_text())])
+        tool_input = json.loads(make_analysis_text())
+        response = mock.Mock(
+            content=[mock.Mock(type="tool_use", input=tool_input)]
+        )
         client = mock.Mock()
         client.with_options.return_value.messages.create.return_value = response
         anthropic_module = mock.Mock()
@@ -409,7 +443,9 @@ class TestAnthropicApiBackend(unittest.TestCase):
         self.assertFalse(analysis["prompt"]["has_issues"])
         call = client.with_options.return_value.messages.create.call_args.kwargs
         self.assertEqual(call["model"], "claude-test")
-        self.assertEqual(call["output_config"]["format"]["type"], "json_schema")
+        # Structured output via tool-use (the supported Messages-API mechanism).
+        self.assertEqual(call["tool_choice"]["name"], "prompt_dual_coach_analysis")
+        self.assertEqual(call["tools"][0]["input_schema"], coach.ANALYSIS_SCHEMA)
 
 
 def make_analysis_text():

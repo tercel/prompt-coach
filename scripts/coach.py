@@ -44,12 +44,15 @@ Configuration (environment variables):
                            recommended Beginner | Intermediate | Advanced
                            (or CEFR A1-C2). (default: "Advanced")
   COACH_MODEL              override both backend models (default: CLI config /
-                           "gpt-5-mini" for API)
+                           "gpt-4o-mini" for API)
   COACH_CLI_MODEL          override only the Codex CLI model
   COACH_API_MODEL          override only the OpenAI API model
   COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
   COACH_MODE               "annotate" (default) | "block"
-  COACH_MIN_PROMPT_CHARS   skip prompts shorter than this (default: 12)
+  COACH_MIN_PROMPT_CHARS   ultra-short multi-word floor (default: 6). Trivial
+                           input (bare answers, dev commands, single tokens) is
+                           skipped regardless; short-but-vague multi-word prompts
+                           like "fix bug" are coached.
   COACH_CONTEXT_MESSAGES   recent turns of conversation context to include
                            (default: 6; set 0 to analyze the prompt in isolation)
   COACH_CONTEXT_CHARS      max characters of rendered context (default: 2000)
@@ -353,9 +356,9 @@ def detect_platform(env):
 def load_config(env):
     """Build a config dict from an environment-like mapping."""
     try:
-        min_chars = int(env.get("COACH_MIN_PROMPT_CHARS", "12") or "12")
+        min_chars = int(env.get("COACH_MIN_PROMPT_CHARS", "6") or "6")
     except (TypeError, ValueError):
-        min_chars = 12
+        min_chars = 6
     codex_bin = env.get("COACH_CODEX_BIN") or shutil.which(
         "codex", path=env.get("PATH")
     )
@@ -385,9 +388,9 @@ def load_config(env):
         "coach_language": coach_language,
         "level": env.get("COACH_LEVEL", "Advanced"),
         "cli_model": (env.get("COACH_CLI_MODEL") or shared_model).strip(),
-        "api_model": (env.get("COACH_API_MODEL") or shared_model or "gpt-5-mini").strip(),
+        "api_model": (env.get("COACH_API_MODEL") or shared_model or "gpt-4o-mini").strip(),
         "anthropic_model": (
-            env.get("COACH_ANTHROPIC_MODEL") or shared_model or "claude-haiku-4-5"
+            env.get("COACH_ANTHROPIC_MODEL") or shared_model or "claude-haiku-4-5-20251001"
         ).strip(),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
         "min_chars": min_chars,
@@ -433,8 +436,9 @@ def extract_json_text(text):
         t = t[3:]
         if t[:4].lower() == "json":
             t = t[4:]
-        if t.endswith("```"):
-            t = t[:-3]
+        end = t.rfind("```")
+        if end != -1:
+            t = t[:end]
         t = t.strip()
     if not t.startswith("{"):
         start, end = t.find("{"), t.rfind("}")
@@ -443,18 +447,57 @@ def extract_json_text(text):
     return t
 
 
+# Multi-word phrases whose meaning is fully carried by project/git/conversation
+# state — coaching them is pure noise. (Single-word commands like "commit",
+# "build", "lint" are already caught by the single-token rule below.)
+_SKIP_PHRASES = frozenset({
+    "build it", "test it", "run it", "ship it", "do it", "try it", "fix it",
+    "run tests", "run test", "run build", "run lint", "run dev",
+    "commit and push", "add and commit", "stage and commit",
+    "install dependencies", "install deps", "install it",
+    "go ahead", "looks good", "thank you", "thanks a lot",
+})
+
+# Unambiguous CLI prefixes (trailing space avoids matching English words like
+# "github" or "gopher"). Deliberately excludes ambiguous tokens such as
+# "make"/"go" so "make it better" / "go implement X" still get coached.
+_CMD_PREFIXES = (
+    "git ", "npm ", "npx ", "yarn ", "pnpm ", "cargo ",
+    "pip ", "poetry ", "docker ", "kubectl ",
+)
+
+
 def should_skip(prompt, min_chars):
-    """Cheap pre-filter so trivial / non-natural-language input is ignored."""
+    """Cheap, deterministic pre-filter run before any model call.
+
+    Skips only input that is unambiguously not worth coaching — slash/shell
+    passthroughs, bare answers, flow-control words, known one-shot dev commands,
+    single tokens, and ultra-short fragments. Multi-word natural-language
+    prompts — even short, vague ones like "fix bug" or "review code" — pass
+    through; the model (which reads recent conversation) decides whether they
+    actually need coaching and stays silent on context-clear follow-ups.
+    """
     if prompt is None:
         return True
     s = prompt.strip()
     if not s:
         return True
-    if s.startswith("/"):   # slash command
+    if s[0] in ("/", "!"):   # slash command / shell passthrough
         return True
-    if s.startswith("!"):   # shell passthrough
+    # Normalize: lowercase, collapse whitespace, drop trailing punctuation.
+    norm = " ".join(s.lower().split()).rstrip(" .!?,;:")
+    if not norm:
         return True
-    if len(s) < min_chars:
+    if norm.isdigit():       # "1" / "2" — answering a numbered choice
+        return True
+    if norm in _SKIP_PHRASES:
+        return True
+    if norm.startswith(_CMD_PREFIXES):
+        return True
+    words = norm.split()
+    if len(words) <= 1:      # single token: command, answer, or pronoun fragment
+        return True
+    if len(s) < min_chars:   # ultra-short multi-word floor ("do x", "go on")
         return True
     return False
 
@@ -694,13 +737,20 @@ def _analyze_anthropic_api(prompt, cfg, context=""):
         max_tokens=1024,
         system=_system(cfg),
         messages=[{"role": "user", "content": _user_content(prompt, context)}],
-        output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+        tools=[{
+            "name": "prompt_dual_coach_analysis",
+            "description": "Return the dual-axis coaching analysis.",
+            "input_schema": ANALYSIS_SCHEMA,
+        }],
+        tool_choice={"type": "tool", "name": "prompt_dual_coach_analysis"},
     )
-    text = next(
-        (block.text for block in resp.content if getattr(block, "type", None) == "text"),
-        "",
+    tool_block = next(
+        (b for b in resp.content if getattr(b, "type", None) == "tool_use"),
+        None,
     )
-    return parse_analysis_text(extract_json_text(text))
+    if tool_block is None:
+        raise RuntimeError("Anthropic API returned no tool_use block")
+    return parse_analysis_text(json.dumps(getattr(tool_block, "input")))
 
 
 def analyze(prompt, cfg, context=""):
