@@ -1,0 +1,8 @@
+{
+  "name": "prompt-dual-coach",
+  "description": "Dual-axis coaching on every prompt: improves your prompt as a coding instruction AND corrects + rewrites your target-language expression, each with a short explanation. A UserPromptSubmit hook prototype for validating the two-axis coaching brain before building the standalone real-time product.",
+  "version": "0.1.0",
+  "author": {
+    "name": "tercel"
+  }
+}
