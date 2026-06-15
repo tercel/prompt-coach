@@ -216,6 +216,65 @@ class TestDetectNativeLanguage(unittest.TestCase):
         self.assertEqual(coach.detect_native_language({}, default="Spanish"), "Spanish")
 
 
+class TestDryRunPrompt(unittest.TestCase):
+    def test_args_preferred(self):
+        self.assertEqual(
+            coach._dry_run_prompt(["--dry-run", "hello", "world"], "ignored"),
+            "hello world",
+        )
+
+    def test_stdin_fallback(self):
+        self.assertEqual(coach._dry_run_prompt(["--dry-run"], "piped text\n"), "piped text")
+
+    def test_empty(self):
+        self.assertEqual(coach._dry_run_prompt(["--dry-run"], ""), "")
+
+
+class TestLanguageGate(unittest.TestCase):
+    def test_explicit_equal_disables(self):
+        cfg = coach.load_config(
+            {"COACH_NATIVE_LANG": "English", "COACH_TARGET_LANG": "English"}
+        )
+        self.assertFalse(cfg["coach_language"])
+
+    def test_explicit_equal_case_insensitive(self):
+        cfg = coach.load_config(
+            {"COACH_NATIVE_LANG": "english ", "COACH_TARGET_LANG": "English"}
+        )
+        self.assertFalse(cfg["coach_language"])
+
+    def test_explicit_different_enabled(self):
+        cfg = coach.load_config(
+            {"COACH_NATIVE_LANG": "Chinese", "COACH_TARGET_LANG": "English"}
+        )
+        self.assertTrue(cfg["coach_language"])
+
+    def test_autodetected_equal_keeps_enabled(self):
+        # native auto-detected English == target English, but NOT explicit -> stay on
+        cfg = coach.load_config({"LANG": "en_US.UTF-8", "COACH_TARGET_LANG": "English"})
+        self.assertTrue(cfg["coach_language"])
+
+    def test_default_enabled(self):
+        self.assertTrue(coach.load_config({})["coach_language"])
+
+    def test_gate_zeros_language_axis(self):
+        cfg = coach.load_config(
+            {"COACH_NATIVE_LANG": "English", "COACH_TARGET_LANG": "English"}
+        )
+        gated = coach.gate_language(make_analysis(True, True), cfg)
+        self.assertFalse(gated["language"]["has_issues"])
+        self.assertEqual(gated["language"]["corrections"], [])
+        self.assertEqual(gated["language"]["improved"], "")
+        self.assertTrue(gated["prompt"]["has_issues"])  # prompt axis preserved
+
+    def test_gate_noop_when_enabled(self):
+        cfg = coach.load_config(
+            {"COACH_NATIVE_LANG": "Chinese", "COACH_TARGET_LANG": "English"}
+        )
+        analysis = make_analysis(True, True)
+        self.assertIs(coach.gate_language(analysis, cfg), analysis)
+
+
 class TestExtractJsonText(unittest.TestCase):
     OBJ = '{"language":{"has_issues":false,"corrections":[],"improved":""},' \
           '"prompt":{"has_issues":false,"improved":"","guidance":""}}'

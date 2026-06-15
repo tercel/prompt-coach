@@ -30,6 +30,8 @@ Backends (env COACH_BACKEND):
 Configuration (environment variables):
   COACH_BACKEND            "auto" (default) | "cli" | "api"
   COACH_CLAUDE_BIN         path to the `claude` binary (default: found on PATH)
+  COACH_CLI_FLAGS          extra space-separated flags for the `claude` CLI call
+                           (e.g. "--bare") — for experimenting with faster boot
   ANTHROPIC_API_KEY        required only for the "api" backend / fallback
   COACH_TARGET_LANG        target language to coach (default: "English")
   COACH_NATIVE_LANG        your native language, used for explanations
@@ -166,6 +168,14 @@ def _user_content(prompt, context=""):
 
 def _flag(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dry_run_prompt(args, stdin_text):
+    """Extract the prompt for --dry-run from CLI args (preferred) or stdin."""
+    rest = [a for a in args if a != "--dry-run"]
+    if rest:
+        return " ".join(rest).strip()
+    return (stdin_text or "").strip()
 
 
 def _to_float(value, default):
@@ -323,11 +333,24 @@ def load_config(env):
     claude_bin = env.get("COACH_CLAUDE_BIN") or shutil.which(
         "claude", path=env.get("PATH")
     )
+    target = env.get("COACH_TARGET_LANG", "English")
+    native_explicit = env.get("COACH_NATIVE_LANG")
+    native = native_explicit or detect_native_language(env)
+    # Disable the language axis ONLY when the user EXPLICITLY declares their native
+    # language to equal the target (a native practicing their own tongue — nothing
+    # to correct). If native is merely auto-detected and happens to match the
+    # target, keep it on: the user may be a non-native on a foreign-locale machine,
+    # and for a true native the axis simply self-suppresses (has_issues=false).
+    coach_language = not (
+        bool(native_explicit)
+        and native.strip().lower() == target.strip().lower()
+    )
     return {
         "backend": (env.get("COACH_BACKEND", "auto") or "auto").strip().lower(),
         "claude_bin": claude_bin,
-        "target": env.get("COACH_TARGET_LANG", "English"),
-        "native": env.get("COACH_NATIVE_LANG") or detect_native_language(env),
+        "target": target,
+        "native": native,
+        "coach_language": coach_language,
         "level": env.get("COACH_LEVEL", "Advanced"),
         "model": env.get("COACH_MODEL", "claude-haiku-4-5"),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
@@ -475,9 +498,29 @@ def build_delivery(analysis, cfg):
 # ---------------------------------------------------------------------------
 
 def _system(cfg):
-    return SYSTEM_TEMPLATE.format(
+    base = SYSTEM_TEMPLATE.format(
         native=cfg["native"], target=cfg["target"], level=cfg["level"]
     )
+    if not cfg.get("coach_language", True):
+        base += (
+            "\n\nIMPORTANT: The user's native language IS the target language, so "
+            "the language axis does not apply. Always return language with "
+            'has_issues=false, corrections=[], improved="". Analyze ONLY the prompt '
+            "axis."
+        )
+    return base
+
+
+def gate_language(analysis, cfg):
+    """Suppress the language axis when it doesn't apply (native == target)."""
+    if cfg.get("coach_language", True):
+        return analysis
+    return {
+        "language": {"has_issues": False, "corrections": [], "improved": ""},
+        "prompt": analysis.get(
+            "prompt", {"has_issues": False, "improved": "", "guidance": ""}
+        ),
+    }
 
 
 def _analyze_cli(prompt, cfg, context=""):
@@ -486,10 +529,18 @@ def _analyze_cli(prompt, cfg, context=""):
 
     cmd = [
         cfg["claude_bin"], "-p",
+        # Skip loading the user's MCP servers — they add large per-invocation boot
+        # latency and this is a pure text-analysis call that needs no tools.
+        "--strict-mcp-config",
         "--output-format", "json",
         "--model", cfg["model"],
         "--append-system-prompt", _system(cfg),
     ]
+    # Optional escape hatch for experimenting with leaner-boot flags (e.g. --bare),
+    # space-separated, without editing this file.
+    extra = os.environ.get("COACH_CLI_FLAGS", "").split()
+    if extra:
+        cmd[2:2] = extra
     child_env = dict(os.environ)
     child_env["COACH_NESTED"] = "1"  # break hook recursion in the nested run
     proc = subprocess.run(
@@ -551,7 +602,41 @@ def analyze(prompt, cfg, context=""):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def dry_run(argv):
+    """Local try-it mode: analyze a prompt and print the coaching block.
+
+    Usage:  python3 coach.py --dry-run "your prompt here"
+            echo "your prompt" | python3 coach.py --dry-run
+    """
+    prompt = _dry_run_prompt(argv, "" if sys.stdin.isatty() else sys.stdin.read())
+    if not prompt:
+        sys.stderr.write(
+            'usage: coach.py --dry-run "your prompt"  (or pipe text on stdin)\n'
+        )
+        return 2
+    cfg = load_config(os.environ)
+    if not backend_available(cfg):
+        sys.stderr.write(
+            "No backend available: install the `claude` CLI or set ANTHROPIC_API_KEY.\n"
+        )
+        return 1
+    try:
+        analysis = gate_language(analyze(prompt, cfg), cfg)
+    except Exception as exc:
+        sys.stderr.write("analysis failed: %r\n" % (exc,))
+        return 1
+    if not has_any_issues(analysis):
+        print("[prompt-dual-coach] No issues found — looks good.")
+        return 0
+    print(format_coaching(analysis, cfg))
+    return 0
+
+
 def main():
+    # Local try-it mode (user-invoked), checked before the re-entrancy guard.
+    if "--dry-run" in sys.argv[1:]:
+        sys.exit(dry_run(sys.argv[1:]))
+
     # Re-entrancy guard: we are inside our own nested `claude -p` call.
     if _flag(os.environ.get("COACH_NESTED", "")):
         sys.exit(0)
@@ -584,6 +669,7 @@ def main():
             sys.stderr.write("prompt-dual-coach error: %r\n" % (exc,))
         sys.exit(0)
 
+    analysis = gate_language(analysis, cfg)
     out, err, code = build_delivery(analysis, cfg)
     if out:
         sys.stdout.write(out)

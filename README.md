@@ -89,6 +89,12 @@ All via environment variables:
 | `ANTHROPIC_API_KEY` | — | Required only for the `api` backend / fallback. |
 | `COACH_TARGET_LANG` | `English` | The language you want to improve (any language). |
 | `COACH_NATIVE_LANG` | auto | Your native language (explanations are written in it). Auto-detected from your locale (`LANG`/`LC_*`); fallback `English`. Set to override. |
+
+> If you **explicitly** set `COACH_NATIVE_LANG` equal to `COACH_TARGET_LANG`
+> (a native practicing their own language), the language axis is turned off and
+> you get prompt-quality coaching only. If they only match because native was
+> *auto-detected* (e.g. an English-locale machine), the language axis stays on —
+> for a true native it simply finds nothing to fix.
 | `COACH_LEVEL` | `Advanced` | Free text; tunes feedback depth. Recommended: `Beginner` \| `Intermediate` \| `Advanced` (or CEFR `A1`–`C2`). |
 | `COACH_MODEL` | `claude-haiku-4-5` | Fast/cheap by design; runs on every prompt. |
 | `COACH_MODE` | `annotate` | `annotate` (non-blocking) or `block` (see below). |
@@ -146,6 +152,21 @@ The language axis still evaluates the new prompt's expression. Set
 
 The API backend uses the Messages API with `output_config.format` (JSON schema)
 for guaranteed-valid JSON; the CLI backend parses the model's JSON tolerantly.
+
+## Try it locally (no hook wiring)
+
+See the actual coaching output against any prompt, using your configured backend:
+
+```
+python3 scripts/coach.py --dry-run "i want fix the login bug, it not work when token expire"
+# or pipe it:
+echo "now do the same for the logout flow" | python3 scripts/coach.py --dry-run
+```
+
+It prints the dual-axis coaching block (or "looks good" if there's nothing to
+fix). This is the fastest way to judge the feedback quality before wiring the
+hook into Claude Code. (Dry-run analyzes the prompt without conversation
+context.)
 
 ## Develop / test
 
