@@ -9,6 +9,7 @@ or  python3 tests/test_coach.py
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -89,6 +90,224 @@ class TestShouldSkip(unittest.TestCase):
     def test_ultra_short_multiword_floor(self):
         self.assertTrue(coach.should_skip("a b", 6))      # junk below floor
         self.assertTrue(coach.should_skip("go on", 6))    # 5 chars < 6
+
+
+class TestLangModeAndState(unittest.TestCase):
+    def _env(self, tmpdir, **extra):
+        env = {"PATH": "", "CLAUDE_PLUGIN_DATA": tmpdir}
+        env.update(extra)
+        return env
+
+    def test_defaults_correct_on_translate_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d))
+            self.assertTrue(cfg["correct_on"])
+            self.assertFalse(cfg["translate_on"])
+            self.assertEqual(cfg["lang_mode"], "correct")
+            self.assertTrue(cfg["axis_language"])
+
+    def test_translate_only_derives_translate_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(
+                self._env(d, COACH_CORRECT="off", COACH_TRANSLATE="on")
+            )
+            self.assertEqual(cfg["lang_mode"], "translate")
+
+    def test_both_on_derives_auto_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_TRANSLATE="on"))
+            self.assertTrue(cfg["correct_on"])
+            self.assertTrue(cfg["translate_on"])
+            self.assertEqual(cfg["lang_mode"], "auto")
+
+    def test_both_off_disables_language_axis(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_CORRECT="off"))
+            self.assertFalse(cfg["axis_language"])
+
+    def test_load_state_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach.load_state(self._env(d)), {})
+
+    def test_state_scope_global_is_shared(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/a"))
+            b = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/b"))
+            self.assertEqual(a, b)  # global: project dir ignored
+
+    def test_state_scope_project_isolates(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = coach.state_path(
+                self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/proj/a")
+            )
+            b = coach.state_path(
+                self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/proj/b")
+            )
+            self.assertNotEqual(a, b)
+            # Same project → same path (hook and command must agree).
+            a2 = coach.state_path(
+                self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/proj/a")
+            )
+            self.assertEqual(a, a2)
+
+    def test_project_scope_toggle_does_not_leak_across_projects(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj_a = self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/p/a")
+            proj_b = self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/p/b")
+            coach._control(["--ctl", "enable", "translate"], proj_a)
+            self.assertTrue(coach.load_config(proj_a)["translate_on"])
+            self.assertFalse(coach.load_config(proj_b)["translate_on"])
+
+    def test_control_switch_state_wins_over_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_TRANSLATE="off")
+            self.assertEqual(coach._control(["--ctl", "enable", "translate"], env), 0)
+            self.assertTrue(coach.load_config(env)["translate_on"])
+
+    def test_power_off_then_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "power", "off"], env)
+            self.assertTrue(coach.load_config(env)["disabled"])
+            coach._control(["--ctl", "power", "on"], env)
+            self.assertFalse(coach.load_config(env)["disabled"])
+
+    def test_bare_on_off_not_accepted(self):
+        # The master switch is `power on/off`; bare on/off is intentionally not
+        # a command (avoids "is /coach on power, or all features?" ambiguity).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "on"], self._env(d)), 2)
+            self.assertEqual(coach._control(["--ctl", "off"], self._env(d)), 2)
+
+    def test_help_prints_usage_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            for word in ("help", "-h", "--help"):
+                self.assertEqual(coach._control(["--ctl", word], env), 0)
+            # help never writes the state file
+            self.assertFalse(os.path.exists(coach.state_path(env)))
+
+    def test_power_on_overrides_env_disable(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_DISABLE="1")
+            coach._control(["--ctl", "power", "on"], env)
+            self.assertFalse(coach.load_config(env)["disabled"])
+
+    def test_control_bad_action_returns_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "bogus"], self._env(d)), 2)
+
+    def test_features_default_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d))
+            self.assertTrue(cfg["evaluate_on"])
+            self.assertTrue(cfg["correct_on"])
+
+    def test_disable_evaluate_independently(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(coach._control(["--ctl", "disable", "evaluate"], env), 0)
+            cfg = coach.load_config(env)
+            self.assertFalse(cfg["evaluate_on"])
+            self.assertTrue(cfg["axis_language"])  # language untouched
+
+    def test_enable_disable_correct_and_translate_independent(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "enable", "translate"], env)
+            coach._control(["--ctl", "disable", "correct"], env)
+            cfg = coach.load_config(env)
+            self.assertFalse(cfg["correct_on"])
+            self.assertTrue(cfg["translate_on"])
+            self.assertEqual(cfg["lang_mode"], "translate")
+            self.assertTrue(cfg["evaluate_on"])  # evaluate untouched
+
+    def test_enable_multiple_features_at_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(
+                coach._control(["--ctl", "enable", "correct", "translate"], env), 0
+            )
+            cfg = coach.load_config(env)
+            self.assertTrue(cfg["correct_on"])
+            self.assertTrue(cfg["translate_on"])
+            self.assertEqual(cfg["lang_mode"], "auto")
+
+    def test_disable_multiple_with_comma_and_hyphen(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(
+                coach._control(["--ctl", "disable", "correct,translate"], env), 0
+            )
+            cfg = coach.load_config(env)
+            self.assertFalse(cfg["axis_language"])
+            # hyphenated master: "power-off"
+            self.assertEqual(coach._control(["--ctl", "power-off"], env), 0)
+            self.assertTrue(coach.load_config(env)["disabled"])
+
+    def test_enable_requires_a_feature(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "enable"], self._env(d)), 2)
+
+    def test_enable_unknown_feature_returns_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                coach._control(["--ctl", "enable", "bogus"], self._env(d)), 2
+            )
+
+    def test_env_feature_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_EVALUATE="off"))
+            self.assertFalse(cfg["evaluate_on"])
+
+    def test_gate_axes_drops_prompt_when_off(self):
+        cfg = {"coach_language": True, "axis_language": True, "evaluate_on": False}
+        gated = coach.gate_axes(make_analysis(True, True), cfg)
+        self.assertFalse(gated["prompt"]["has_issues"])      # prompt zeroed
+        self.assertTrue(gated["language"]["has_issues"])     # language kept
+
+    def test_gate_axes_drops_language_when_off(self):
+        cfg = {"coach_language": True, "axis_language": False, "evaluate_on": True}
+        gated = coach.gate_axes(make_analysis(True, True), cfg)
+        self.assertFalse(gated["language"]["has_issues"])
+        self.assertTrue(gated["prompt"]["has_issues"])
+
+    def test_gate_axes_identity_when_all_on(self):
+        cfg = {"coach_language": True, "axis_language": True, "evaluate_on": True}
+        analysis = make_analysis(True, True)
+        self.assertIs(coach.gate_axes(analysis, cfg), analysis)
+
+    def test_control_status_does_not_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(coach._control(["--ctl", "status"], env), 0)
+            self.assertFalse(os.path.exists(coach.state_path(env)))
+
+    def test_system_prompt_translate_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(
+                self._env(
+                    d, COACH_CORRECT="off", COACH_TRANSLATE="on",
+                    COACH_NATIVE_LANG="Chinese",
+                )
+            )
+            sysp = coach._system(cfg)
+            self.assertIn("render it", sysp)
+            self.assertIn("Chinese", sysp)
+
+    def test_system_prompt_correct_mode_is_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            sysp = coach._system(coach.load_config(self._env(d)))
+            self.assertIn("evaluate the English-language expression", sysp)
+
+    def test_format_coaching_translate_label(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(
+                self._env(d, COACH_CORRECT="off", COACH_TRANSLATE="on")
+            )
+            block = coach.format_coaching(make_analysis(), cfg)
+            self.assertIn("[English]", block)
+            self.assertNotIn("[Language: English]", block)
 
 
 class TestParse(unittest.TestCase):
@@ -330,7 +549,7 @@ class TestCodexCliBackend(unittest.TestCase):
     def _run_writing_last_message(self, message):
         """subprocess.run stub that writes `message` to --output-last-message."""
 
-        def _side_effect(cmd, **_kwargs):
+        def _side_effect(cmd, *_a, **_kw):  # noqa
             path = cmd[cmd.index("--output-last-message") + 1]
             with open(path, "w", encoding="utf-8") as out:
                 out.write(message)
@@ -360,7 +579,7 @@ class TestCodexCliBackend(unittest.TestCase):
         # braces) must not corrupt parsing.
         cfg = coach.load_config({"PATH": "", "COACH_CODEX_BIN": "/bin/codex"})
 
-        def _side_effect(cmd, **_kwargs):
+        def _side_effect(cmd, *_a, **_kw):  # noqa
             path = cmd[cmd.index("--output-last-message") + 1]
             with open(path, "w", encoding="utf-8") as out:
                 out.write(make_analysis_text())

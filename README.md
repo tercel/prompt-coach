@@ -131,6 +131,10 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_TARGET_LANG` | `English` | Language being practiced. |
 | `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
 | `COACH_LEVEL` | `Advanced` | Feedback depth. |
+| `COACH_EVALUATE` | `on` | Prompt-quality coaching on/off. Overridden live by `/coach enable/disable evaluate`. |
+| `COACH_CORRECT` | `on` | Target-language correction on/off. Overridden live by `/coach enable/disable correct`. |
+| `COACH_TRANSLATE` | `off` | Native→target translation on/off. Overridden live by `/coach enable/disable translate`. |
+| `COACH_STATE_SCOPE` | `global` | `global` or `project` — how widely a `/coach` toggle applies. |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
 | `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
 | `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
@@ -169,6 +173,56 @@ caught:
 Everything that passes the filter goes to the model, which reads recent
 conversation and stays silent on context-clear follow-ups. `make`/`go` are
 treated as English words, not CLI commands, so `make it better` is coached.
+
+## Language modes & the `/coach` command
+
+The language axis has three modes, and the **whole hook** can be toggled on/off —
+all at runtime via the `/coach` slash command (no restart, takes effect on your
+next prompt):
+
+A `power` switch for the whole hook plus `enable`/`disable` verbs for the three
+coaching features — all live via `/coach`:
+
+| `/coach …` | Effect |
+|---|---|
+| `/coach power on` · `/coach power off` | The **entire** hook |
+| `/coach enable <feature…>` | Turn one or more features **on** |
+| `/coach disable <feature…>` | Turn one or more features **off** |
+| `/coach status` | Show current state (each feature, scope, state-file path) |
+| `/coach help` | Show the command usage |
+
+**Features:** `evaluate` (prompt-quality coaching) · `correct` (fix your
+*target-language* writing) · `translate` (render *native-language* input in the
+target language).
+
+You can pass several at once: `/coach enable correct translate` (= auto: correct what
+you write in the target language, translate what you write in your native one);
+`/coach disable correct translate` turns all language coaching off. Separators are
+flexible — space, comma, or hyphen (`disable correct,translate`, `power-off`).
+
+Defaults: hook on, `evaluate` on, `correct` on, `translate` off. So a Chinese speaker
+practicing English: type English for corrections (default); `/coach enable translate`
+to also get an English version when you type Chinese; `/coach disable correct` to keep
+only translation; `/coach disable evaluate` to silence prompt-quality tips.
+
+Each toggle is written to a small state file (under `CLAUDE_PLUGIN_DATA` / `PLUGIN_DATA`,
+else `~/.claude/` — never inside your project) that the hook reads every prompt; it
+overrides the `COACH_EVALUATE` / `COACH_CORRECT` / `COACH_TRANSLATE` / `COACH_DISABLE`
+env defaults.
+
+### Toggle scope (`COACH_STATE_SCOPE`)
+
+How widely a `/coach` toggle reaches:
+
+| Scope | Behavior |
+|---|---|
+| `global` *(default)* | One shared switch — a toggle affects every session and project. |
+| `project` | Isolated per `CLAUDE_PROJECT_DIR` — "translate in project A" leaves project B untouched. |
+
+**Per-session scope is not offered.** The platform exposes `session_id` only in the
+hook's stdin payload, not as an env var, so the `/coach` command (a plain subprocess)
+can't know which session it's in. `project` is the finest reliable granularity; `/coach
+status` prints the active scope and the exact state-file path.
 
 ## Delivery modes
 

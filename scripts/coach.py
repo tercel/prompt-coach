@@ -48,6 +48,12 @@ Configuration (environment variables):
   COACH_CLI_MODEL          override only the Codex CLI model
   COACH_API_MODEL          override only the OpenAI API model
   COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
+  Coaching features — each independent on/off, overridden live by `/coach`:
+  COACH_EVALUATE           on/off (default on) — prompt-quality coaching
+  COACH_CORRECT            on/off (default on) — correct TARGET-language writing
+  COACH_TRANSLATE          on/off (default off) — render NATIVE input in TARGET
+                           correct + translate may BOTH be on (= auto: correct
+                           target-language input, translate native input).
   COACH_MODE               "annotate" (default) | "block"
   COACH_MIN_PROMPT_CHARS   ultra-short multi-word floor (default: 6). Trivial
                            input (bare answers, dev commands, single tokens) is
@@ -57,8 +63,18 @@ Configuration (environment variables):
                            (default: 6; set 0 to analyze the prompt in isolation)
   COACH_CONTEXT_CHARS      max characters of rendered context (default: 2000)
   COACH_TIMEOUT            backend timeout seconds (default: 25)
+  COACH_STATE_SCOPE        "global" (default) | "project". Controls how widely a
+                           `/coach` toggle applies: global = one shared switch;
+                           project = isolated per CLAUDE_PROJECT_DIR. (Per-session
+                           is not possible — see state_path().)
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
+
+Runtime toggle: the `/coach` command (power on/off | enable/disable evaluate|correct|
+translate | status) writes a small state file (under CLAUDE_PLUGIN_DATA / PLUGIN_DATA,
+else ~/.claude) that this hook reads on every prompt. It overrides COACH_DISABLE /
+COACH_EVALUATE / COACH_CORRECT / COACH_TRANSLATE so you can flip behavior mid-session
+with no restart.
 
 Re-entrancy: the CLI backend's nested `codex exec` / `claude -p` call could
 re-fire UserPromptSubmit and re-invoke this hook. We set COACH_NESTED=1 on the
@@ -68,6 +84,7 @@ Design rule: this hook must NEVER break your workflow. Any error (missing
 backend, network failure, bad JSON) results in a clean exit 0 with no output.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -118,12 +135,16 @@ ANALYSIS_SCHEMA = {
     "required": ["language", "prompt"],
 }
 
-SYSTEM_TEMPLATE = (
+_SYS_HEADER = (
     "You are a dual-axis writing coach embedded in a developer's AI coding "
     "assistant. The developer is a native {native} speaker practicing {target} "
     "at {level} level. You are given the recent CONVERSATION so far (it may be "
     "empty) and the user's NEW prompt. Analyze the NEW prompt on TWO independent "
     "axes and return ONLY the JSON object.\n\n"
+)
+
+# Language axis — three behaviors, picked from the correct/translate switches.
+_LANG_CORRECT = (
     "1. language — evaluate the {target}-language expression of the NEW prompt.\n"
     "   - has_issues: true if grammar, word choice, or naturalness can be improved.\n"
     "   - corrections: specific fixes. Each: original (the exact problematic span), "
@@ -131,7 +152,39 @@ SYSTEM_TEMPLATE = (
     "explaining the rule).\n"
     "   - improved: a fully rewritten, natural {target} version of the NEW prompt, "
     "keeping the technical meaning identical.\n"
-    "   If already native-quality, set has_issues=false, corrections=[], improved=\"\".\n\n"
+    "   If the prompt is NOT written in {target}, or is already native-quality, set "
+    "has_issues=false, corrections=[], improved=\"\".\n\n"
+)
+_LANG_TRANSLATE = (
+    "1. language — the NEW prompt is written in the user's native {native}; render it "
+    "in natural {target} and teach the rendering.\n"
+    "   - has_issues: true if the prompt contains {native} worth rendering in {target}.\n"
+    "   - corrections: the key phrase mappings. Each: original (the {native} span), "
+    "correction (the natural {target} equivalent), explanation (one short clause in "
+    "{native} on usage / why).\n"
+    "   - improved: a full, natural {target} rendering of the prompt, preserving the "
+    "technical meaning.\n"
+    "   If the prompt is already written in {target} (nothing to render), set "
+    "has_issues=false, corrections=[], improved=\"\".\n\n"
+)
+_LANG_AUTO = (
+    "1. language — adapt to whichever language the NEW prompt is written in.\n"
+    "   - If it is in {target}: CORRECT it — corrections as original→fixed spans, "
+    "improved = polished natural {target}.\n"
+    "   - If it is in the user's native {native}: RENDER it in {target} — corrections as "
+    "{native}→{target} phrase mappings, improved = full natural {target} rendering.\n"
+    "   - has_issues: true when there is anything to correct or render. Explanations are "
+    "ALWAYS written in {native}.\n"
+    "   If the prompt is already flawless {target}, set has_issues=false, corrections=[], "
+    "improved=\"\".\n\n"
+)
+_LANG_AXIS = {
+    "correct": _LANG_CORRECT,
+    "translate": _LANG_TRANSLATE,
+    "auto": _LANG_AUTO,
+}
+
+_PROMPT_AXIS = (
     "2. prompt — evaluate the NEW prompt as the next instruction in THIS conversation.\n"
     "   - has_issues: true ONLY if, given the conversation context, the prompt is "
     "still genuinely ambiguous or under-specified. Do NOT flag information already "
@@ -148,6 +201,9 @@ SYSTEM_TEMPLATE = (
     "   If already strong, set has_issues=false, improved=\"\", guidance=\"\".\n\n"
     "Be concise. Never answer or execute the prompt — only analyze it."
 )
+
+# Back-compat alias: the default (correction-mode) full template.
+SYSTEM_TEMPLATE = _SYS_HEADER + _LANG_CORRECT + _PROMPT_AXIS
 
 # Shape hint for backends without schema enforcement (the CLI). Harmless on the
 # API path, which additionally enforces ANALYSIS_SCHEMA via output_config.format.
@@ -182,6 +238,28 @@ def _user_content(prompt, context=""):
 
 def _flag(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+_ON_WORDS = ("1", "true", "yes", "on", "enable", "enabled")
+_OFF_WORDS = ("0", "false", "no", "off", "disable", "disabled")
+
+
+def _onoff(value):
+    """Parse an on/off word. Returns True/False, or None if unrecognized."""
+    v = (value or "").strip().lower()
+    if v in _ON_WORDS:
+        return True
+    if v in _OFF_WORDS:
+        return False
+    return None
+
+
+def _axis_flag(state_val, env_val, default=True):
+    """Resolve a coaching-axis on/off: state file wins, then env, then default."""
+    if state_val is not None:
+        return bool(state_val)
+    parsed = _onoff(env_val) if env_val is not None else None
+    return default if parsed is None else parsed
 
 
 def _dry_run_prompt(args, stdin_text):
@@ -353,6 +431,47 @@ def detect_platform(env):
     return "codex"
 
 
+def state_path(env):
+    """Path to the runtime state file toggled by the `/coach` command.
+
+    Scope (env COACH_STATE_SCOPE):
+      - "global" (default): one shared file — a toggle affects every session.
+      - "project": keyed by CLAUDE_PROJECT_DIR / PROJECT_DIR (a stable per-project
+        filename suffix), so different projects are independent. Both the hook and
+        the `/coach` command see that env var, so they compute the same path.
+
+    True per-session scope is not offered: the platform exposes session_id only in
+    the hook's stdin payload, not as an env var, so the `/coach` command (a plain
+    subprocess) has no reliable way to learn which session it is in.
+
+    The file always lives in the plugin data dir (CLAUDE_PLUGIN_DATA / PLUGIN_DATA,
+    else ~/.claude) — never inside the user's project, so it can't be committed.
+    """
+    base = (
+        env.get("CLAUDE_PLUGIN_DATA")
+        or env.get("PLUGIN_DATA")
+        or os.path.join(os.path.expanduser("~"), ".claude")
+    )
+    name = "prompt-dual-coach-state.json"
+    scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
+    if scope == "project":
+        proj = env.get("CLAUDE_PROJECT_DIR") or env.get("PROJECT_DIR") or env.get("PWD")
+        if proj:
+            digest = hashlib.sha1(proj.encode("utf-8")).hexdigest()[:12]
+            name = "prompt-dual-coach-state.%s.json" % digest
+    return os.path.join(base, name)
+
+
+def load_state(env):
+    """Read the runtime state file. Returns {} on any error (never breaks)."""
+    try:
+        with open(state_path(env), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def load_config(env):
     """Build a config dict from an environment-like mapping."""
     try:
@@ -378,6 +497,27 @@ def load_config(env):
         bool(native_explicit)
         and native.strip().lower() == target.strip().lower()
     )
+    # Every coaching feature is an independent on/off switch, written by `/coach`
+    # to the state file (which overrides the env defaults). The language axis has
+    # two such switches — correction and translation — that may BOTH be on:
+    #   correct only  -> correct TARGET-language writing        (lang_mode "correct")
+    #   translate only-> render NATIVE-language input in TARGET (lang_mode "translate")
+    #   both on       -> do whichever fits each prompt          (lang_mode "auto")
+    #   both off      -> language axis silent
+    state = load_state(env)
+    disabled = _flag(env.get("COACH_DISABLE", ""))
+    if "enabled" in state:                 # explicit toggle wins over env
+        disabled = not bool(state["enabled"])
+    evaluate_on = _axis_flag(state.get("evaluate"), env.get("COACH_EVALUATE"), True)
+    correct_on = _axis_flag(state.get("correct"), env.get("COACH_CORRECT"), True)
+    translate_on = _axis_flag(state.get("translate"), env.get("COACH_TRANSLATE"), False)
+    axis_language = correct_on or translate_on
+    if correct_on and translate_on:
+        lang_mode = "auto"
+    elif translate_on:
+        lang_mode = "translate"
+    else:
+        lang_mode = "correct"
     return {
         "backend": (env.get("COACH_BACKEND", "auto") or "auto").strip().lower(),
         "platform": detect_platform(env),
@@ -386,6 +526,10 @@ def load_config(env):
         "target": target,
         "native": native,
         "coach_language": coach_language,
+        "evaluate_on": evaluate_on,
+        "axis_language": axis_language,
+        "correct_on": correct_on,
+        "translate_on": translate_on,
         "level": env.get("COACH_LEVEL", "Advanced"),
         "cli_model": (env.get("COACH_CLI_MODEL") or shared_model).strip(),
         "api_model": (env.get("COACH_API_MODEL") or shared_model or "gpt-4o-mini").strip(),
@@ -393,11 +537,12 @@ def load_config(env):
             env.get("COACH_ANTHROPIC_MODEL") or shared_model or "claude-haiku-4-5-20251001"
         ).strip(),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
+        "lang_mode": lang_mode,
         "min_chars": min_chars,
         "context_messages": _to_int(env.get("COACH_CONTEXT_MESSAGES"), 6),
         "context_chars": _to_int(env.get("COACH_CONTEXT_CHARS"), 2000),
         "timeout": _to_float(env.get("COACH_TIMEOUT"), 25.0),
-        "disabled": _flag(env.get("COACH_DISABLE", "")),
+        "disabled": disabled,
         "debug": _flag(env.get("COACH_DEBUG", "")),
         "has_api_key": bool(env.get("OPENAI_API_KEY")),
         "has_anthropic_key": bool(env.get("ANTHROPIC_API_KEY")),
@@ -539,7 +684,10 @@ def format_coaching(analysis, cfg):
             lines.append("  tip: " + prm["guidance"])
     lang = analysis.get("language", {})
     if lang.get("has_issues"):
-        lines.append("[Language: %s]" % cfg["target"])
+        if cfg.get("lang_mode", "correct") in ("translate", "auto"):
+            lines.append("[%s]" % cfg["target"])
+        else:
+            lines.append("[Language: %s]" % cfg["target"])
         for c in lang.get("corrections", []):
             lines.append(
                 '  x "%s" -> "%s"  (%s)'
@@ -591,7 +739,8 @@ def build_delivery(analysis, cfg):
 # ---------------------------------------------------------------------------
 
 def _system(cfg):
-    base = SYSTEM_TEMPLATE.format(
+    lang_axis = _LANG_AXIS.get(cfg.get("lang_mode", "correct"), _LANG_CORRECT)
+    base = (_SYS_HEADER + lang_axis + _PROMPT_AXIS).format(
         native=cfg["native"], target=cfg["target"], level=cfg["level"]
     )
     if not cfg.get("coach_language", True):
@@ -604,16 +753,34 @@ def _system(cfg):
     return base
 
 
-def gate_language(analysis, cfg):
-    """Suppress the language axis when it doesn't apply (native == target)."""
-    if cfg.get("coach_language", True):
+def gate_axes(analysis, cfg):
+    """Zero out whichever coaching axes are off.
+
+    The language axis is off when native==target (nothing to coach) OR the user
+    turned it off (`/coach disable correct translate`). The prompt (evaluate) axis is
+    off when the user ran `/coach disable evaluate`. Returns the analysis unchanged
+    when both are on.
+    """
+    lang_on = cfg.get("coach_language", True) and cfg.get("axis_language", True)
+    prompt_on = cfg.get("evaluate_on", True)
+    if lang_on and prompt_on:
         return analysis
     return {
-        "language": {"has_issues": False, "corrections": [], "improved": ""},
-        "prompt": analysis.get(
-            "prompt", {"has_issues": False, "improved": "", "guidance": ""}
+        "language": (
+            analysis.get("language", {"has_issues": False, "corrections": [], "improved": ""})
+            if lang_on
+            else {"has_issues": False, "corrections": [], "improved": ""}
+        ),
+        "prompt": (
+            analysis.get("prompt", {"has_issues": False, "improved": "", "guidance": ""})
+            if prompt_on
+            else {"has_issues": False, "improved": "", "guidance": ""}
         ),
     }
+
+
+# Backward-compatible alias (older name; same behavior plus the prompt axis).
+gate_language = gate_axes
 
 
 def _analyze_cli(prompt, cfg, context=""):
@@ -800,6 +967,101 @@ def analyze(prompt, cfg, context=""):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Each coaching feature is an independent on/off switch -> a state-file key.
+# The three coaching features (command word -> state-file key).
+_FEATURES = {
+    "evaluate": "evaluate",    # prompt-quality coaching
+    "correct": "correct",      # correct target-language writing
+    "translate": "translate",  # render native-language input in the target
+}
+_CTL_USAGE = (
+    "prompt-dual-coach — /coach <action>\n"
+    "  power on | power off          the whole hook\n"
+    "  enable  <evaluate|correct|translate ...>   turn feature(s) on\n"
+    "  disable <evaluate|correct|translate ...>   turn feature(s) off\n"
+    "  status                        show current state\n"
+    "  help                          show this usage\n"
+    "Features: evaluate (prompt quality), correct (fix target-language writing),\n"
+    "          translate (render native-language input in the target language).\n"
+    "correct + translate both on = auto: correct target input, translate native.\n"
+)
+
+
+def _control(argv, env):
+    """Handle `--ctl <action ...>` from the `/coach` command. Returns exit code.
+
+    Appliance-style master switch plus enable/disable verbs (space, hyphen, or
+    comma all separate tokens, so "disable correct,translate" works):
+      power on / power off        the whole hook
+      enable <feature ...>        turn one or more features ON
+      disable <feature ...>       turn one or more features OFF
+      status                      print the current state (no write)
+      help                        print usage and exit
+
+    Features: evaluate (prompt-quality), correct (fix target-language writing),
+    translate (render native-language input in the target). correct + translate
+    may both be on — then each prompt is auto-handled (correct if you wrote the
+    target language, translate if you wrote your native one).
+    """
+    # Normalize separators so "disable correct,translate" / "power-off" all split.
+    raw = [a for a in argv if a != "--ctl"]
+    tokens = []
+    for a in raw:
+        tokens.extend(a.replace("-", " ").replace(",", " ").split())
+    if not tokens:
+        tokens = ["status"]
+    action = tokens[0].lower()
+    rest = [t.lower() for t in tokens[1:]]
+
+    if action in ("help", "h"):   # also matches -h / --help (hyphens stripped above)
+        sys.stdout.write(_CTL_USAGE)
+        return 0
+
+    state = load_state(env)
+    if action == "power":
+        val = _onoff(rest[0] if rest else None)
+        if val is None:
+            sys.stderr.write(_CTL_USAGE)
+            return 2
+        state["enabled"] = val
+    elif action in ("enable", "disable"):
+        if not rest or any(f not in _FEATURES for f in rest):
+            sys.stderr.write(_CTL_USAGE)
+            return 2
+        for feature in rest:
+            state[_FEATURES[feature]] = (action == "enable")
+    elif action != "status":
+        sys.stderr.write(_CTL_USAGE)
+        return 2
+
+    if action != "status":
+        path = state_path(env)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        except OSError as exc:
+            sys.stderr.write("could not write state file: %r\n" % (exc,))
+            return 1
+
+    cfg = load_config(env)
+    scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
+    print(
+        "prompt-dual-coach: power %s | evaluate: %s | correct: %s | translate: %s"
+        % (
+            "off" if cfg["disabled"] else "on",
+            "on" if cfg["evaluate_on"] else "off",
+            "on" if cfg["correct_on"] else "off",
+            "on" if cfg["translate_on"] else "off",
+        )
+    )
+    print(
+        "native %s, practicing %s | scope: %s | state file: %s"
+        % (cfg["native"], cfg["target"], scope, state_path(env))
+    )
+    return 0
+
+
 def dry_run(argv):
     """Local try-it mode: analyze a prompt and print the coaching block.
 
@@ -820,7 +1082,7 @@ def dry_run(argv):
         )
         return 1
     try:
-        analysis = gate_language(analyze(prompt, cfg), cfg)
+        analysis = gate_axes(analyze(prompt, cfg), cfg)
     except Exception as exc:
         sys.stderr.write("analysis failed: %r\n" % (exc,))
         return 1
@@ -832,6 +1094,10 @@ def dry_run(argv):
 
 
 def main():
+    # Control surface for the `/coach` command (toggle on/off, switch mode).
+    if "--ctl" in sys.argv[1:]:
+        sys.exit(_control(sys.argv[1:], os.environ))
+
     # Local try-it mode (user-invoked), checked before the re-entrancy guard.
     if "--dry-run" in sys.argv[1:]:
         sys.exit(dry_run(sys.argv[1:]))
@@ -868,7 +1134,7 @@ def main():
             sys.stderr.write("prompt-dual-coach error: %r\n" % (exc,))
         sys.exit(0)
 
-    analysis = gate_language(analysis, cfg)
+    analysis = gate_axes(analysis, cfg)
     out, err, code = build_delivery(analysis, cfg)
     if out:
         sys.stdout.write(out)
