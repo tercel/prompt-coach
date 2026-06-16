@@ -1,5 +1,5 @@
 ---
-description: Control prompt-dual-coach — power switch + enable/disable coaching features
+description: Control prompt-coach — power switch + enable/disable coaching features
 argument-hint: "[power on|power off|enable <feature…>|disable <feature…>|status|help]"
 ---
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prompt Dual-Coach — a Claude Code and Codex UserPromptSubmit hook.
+"""Prompt Coach — a Claude Code and Codex UserPromptSubmit hook.
 
 On every prompt you submit, this hook asks a fast OpenAI model to analyze two
 independent axes and feed coaching back to you:
@@ -452,13 +452,13 @@ def state_path(env):
         or env.get("PLUGIN_DATA")
         or os.path.join(os.path.expanduser("~"), ".claude")
     )
-    name = "prompt-dual-coach-state.json"
+    name = "prompt-coach-state.json"
     scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
     if scope == "project":
         proj = env.get("CLAUDE_PROJECT_DIR") or env.get("PROJECT_DIR") or env.get("PWD")
         if proj:
             digest = hashlib.sha1(proj.encode("utf-8")).hexdigest()[:12]
-            name = "prompt-dual-coach-state.%s.json" % digest
+            name = "prompt-coach-state.%s.json" % digest
     return os.path.join(base, name)
 
 
@@ -674,7 +674,7 @@ def has_any_issues(analysis):
 
 def format_coaching(analysis, cfg):
     """Render the human-facing coaching block (plain text, terminal-safe)."""
-    lines = ["-- Prompt Dual-Coach --"]
+    lines = ["-- Prompt Coach --"]
     prm = analysis.get("prompt", {})
     if prm.get("has_issues"):
         lines.append("[Prompt quality]")
@@ -701,7 +701,7 @@ def format_coaching(analysis, cfg):
 def build_additional_context(analysis, cfg, block):
     """Instruction injected into the active agent's context for annotate mode."""
     lines = [
-        "[prompt-dual-coach] Coaching for the user, a %s speaker practicing %s (%s level)."
+        "[prompt-coach] Coaching for the user, a %s speaker practicing %s (%s level)."
         % (cfg["native"], cfg["target"], cfg["level"]),
         "Display the coaching block below to the user VERBATIM at the very start "
         "of your reply, then answer their request normally.",
@@ -787,7 +787,7 @@ def _analyze_cli(prompt, cfg, context=""):
     """Run analysis through `codex exec` using the user's existing Codex auth."""
     import subprocess
 
-    with tempfile.TemporaryDirectory(prefix="prompt-dual-coach-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="prompt-coach-") as tmpdir:
         schema_path = os.path.join(tmpdir, "analysis-schema.json")
         with open(schema_path, "w", encoding="utf-8") as schema:
             json.dump(ANALYSIS_SCHEMA, schema)
@@ -850,7 +850,7 @@ def _analyze_api(prompt, cfg, context=""):
         text={
             "format": {
                 "type": "json_schema",
-                "name": "prompt_dual_coach_analysis",
+                "name": "prompt_coach_analysis",
                 "strict": True,
                 "schema": ANALYSIS_SCHEMA,
             }
@@ -905,11 +905,11 @@ def _analyze_anthropic_api(prompt, cfg, context=""):
         system=_system(cfg),
         messages=[{"role": "user", "content": _user_content(prompt, context)}],
         tools=[{
-            "name": "prompt_dual_coach_analysis",
+            "name": "prompt_coach_analysis",
             "description": "Return the dual-axis coaching analysis.",
             "input_schema": ANALYSIS_SCHEMA,
         }],
-        tool_choice={"type": "tool", "name": "prompt_dual_coach_analysis"},
+        tool_choice={"type": "tool", "name": "prompt_coach_analysis"},
     )
     tool_block = next(
         (b for b in resp.content if getattr(b, "type", None) == "tool_use"),
@@ -975,7 +975,7 @@ _FEATURES = {
     "translate": "translate",  # render native-language input in the target
 }
 _CTL_USAGE = (
-    "prompt-dual-coach — /coach <action>\n"
+    "prompt-coach — /coach <action>\n"
     "  power on | power off          the whole hook\n"
     "  enable  <evaluate|correct|translate ...>   turn feature(s) on\n"
     "  disable <evaluate|correct|translate ...>   turn feature(s) off\n"
@@ -1047,7 +1047,7 @@ def _control(argv, env):
     cfg = load_config(env)
     scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
     print(
-        "prompt-dual-coach: power %s | evaluate: %s | correct: %s | translate: %s"
+        "prompt-coach: power %s | evaluate: %s | correct: %s | translate: %s"
         % (
             "off" if cfg["disabled"] else "on",
             "on" if cfg["evaluate_on"] else "off",
@@ -1087,7 +1087,7 @@ def dry_run(argv):
         sys.stderr.write("analysis failed: %r\n" % (exc,))
         return 1
     if not has_any_issues(analysis):
-        print("[prompt-dual-coach] No issues found — looks good.")
+        print("[prompt-coach] No issues found — looks good.")
         return 0
     print(format_coaching(analysis, cfg))
     return 0
@@ -1131,7 +1131,7 @@ def main():
         analysis = analyze(prompt, cfg, context)
     except Exception as exc:  # never break the user's workflow
         if cfg["debug"]:
-            sys.stderr.write("prompt-dual-coach error: %r\n" % (exc,))
+            sys.stderr.write("prompt-coach error: %r\n" % (exc,))
         sys.exit(0)
 
     analysis = gate_axes(analysis, cfg)

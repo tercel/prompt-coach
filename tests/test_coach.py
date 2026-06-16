@@ -1,4 +1,4 @@
-"""Unit tests for the Prompt Dual-Coach brain.
+"""Unit tests for the Prompt Coach brain.
 
 These cover the pure helpers only (no network, no SDK). Run with:
 
@@ -663,7 +663,7 @@ class TestAnthropicApiBackend(unittest.TestCase):
         call = client.with_options.return_value.messages.create.call_args.kwargs
         self.assertEqual(call["model"], "claude-test")
         # Structured output via tool-use (the supported Messages-API mechanism).
-        self.assertEqual(call["tool_choice"]["name"], "prompt_dual_coach_analysis")
+        self.assertEqual(call["tool_choice"]["name"], "prompt_coach_analysis")
         self.assertEqual(call["tools"][0]["input_schema"], coach.ANALYSIS_SCHEMA)
 
 

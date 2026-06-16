@@ -1,5 +1,5 @@
 {
-  "name": "prompt-dual-coach",
+  "name": "prompt-coach",
   "description": "Dual-axis coaching on every Claude Code prompt: improves prompt quality and target-language expression.",
   "version": "0.4.0",
   "author": {

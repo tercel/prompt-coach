@@ -1,5 +1,5 @@
 {
-  "name": "prompt-dual-coach",
+  "name": "prompt-coach",
   "version": "0.4.0",
   "description": "Dual-axis coaching on every Codex prompt: improves prompt quality and target-language expression.",
   "author": {
@@ -7,14 +7,14 @@
   },
   "hooks": "./hooks/hooks.json",
   "interface": {
-    "displayName": "Prompt Dual-Coach",
+    "displayName": "Prompt Coach",
     "shortDescription": "Improve prompts and target-language expression",
     "longDescription": "Coach prompt quality and target-language expression on each Codex prompt submission.",
     "developerName": "tercel",
     "category": "Productivity",
     "capabilities": [],
     "defaultPrompt": [
-      "Configure Prompt Dual-Coach for my target language."
+      "Configure Prompt Coach for my target language."
     ]
   }
 }

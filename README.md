@@ -1,4 +1,4 @@
-# prompt-dual-coach
+# prompt-coach
 
 A shared Claude Code and Codex `UserPromptSubmit` plugin that coaches:
 
@@ -34,8 +34,8 @@ API key is available, the plugin falls back to that platform's API.
 The Claude plugin entry point is `.claude-plugin/plugin.json`:
 
 ```text
-/plugin marketplace add /absolute/path/to/prompt-dual-coach
-/plugin install prompt-dual-coach
+/plugin marketplace add /absolute/path/to/prompt-coach
+/plugin install prompt-coach
 ```
 
 Restart Claude Code after installation.
@@ -73,7 +73,7 @@ required there.
 
 The Codex plugin entry point is `.codex-plugin/plugin.json`, which points Codex
 at the hook via its `"hooks": "./hooks/hooks.json"` field. Add this checkout to a
-configured Codex marketplace, install `prompt-dual-coach`, restart Codex, then
+configured Codex marketplace, install `prompt-coach`, restart Codex, then
 review and trust the bundled Hook using `/hooks`.
 
 Both platforms share the same `hooks/hooks.json` and `scripts/coach.py`: Claude
@@ -103,7 +103,7 @@ In that case point the `command` at the working copy with an absolute path —
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /absolute/path/to/prompt-dual-coach/scripts/coach.py",
+            "command": "python3 /absolute/path/to/prompt-coach/scripts/coach.py",
             "timeout": 30
           }
         ]
@@ -174,14 +174,15 @@ Everything that passes the filter goes to the model, which reads recent
 conversation and stays silent on context-clear follow-ups. `make`/`go` are
 treated as English words, not CLI commands, so `make it better` is coached.
 
-## Language modes & the `/coach` command
+## The `/coach` command
 
-The language axis has three modes, and the **whole hook** can be toggled on/off —
-all at runtime via the `/coach` slash command (no restart, takes effect on your
-next prompt):
+> **Command name:** Claude Code namespaces plugin commands, so the actual command
+> is **`/prompt-coach:coach`** (just type `coach` in the `/` menu to fuzzy-match
+> it). It's written `/coach` below for brevity. Runs at runtime with no restart —
+> takes effect on your next prompt.
 
 A `power` switch for the whole hook plus `enable`/`disable` verbs for the three
-coaching features — all live via `/coach`:
+coaching features:
 
 | `/coach …` | Effect |
 |---|---|
