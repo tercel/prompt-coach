@@ -48,7 +48,7 @@ Configuration (environment variables):
   COACH_CLI_MODEL          override only the Codex CLI model
   COACH_API_MODEL          override only the OpenAI API model
   COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
-  Coaching features — each independent on/off, overridden live by `/coach`:
+  Coaching features — each independent on/off, overridden live by `/prompt-coach:*`:
   COACH_EVALUATE           on/off (default on) — prompt-quality coaching
   COACH_CORRECT            on/off (default on) — correct TARGET-language writing
   COACH_TRANSLATE          on/off (default off) — render NATIVE input in TARGET
@@ -64,17 +64,16 @@ Configuration (environment variables):
   COACH_CONTEXT_CHARS      max characters of rendered context (default: 2000)
   COACH_TIMEOUT            backend timeout seconds (default: 25)
   COACH_STATE_SCOPE        "global" (default) | "project". Controls how widely a
-                           `/coach` toggle applies: global = one shared switch;
+                           `/prompt-coach:*` toggle applies: global = one shared switch;
                            project = isolated per CLAUDE_PROJECT_DIR. (Per-session
                            is not possible — see state_path().)
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
 
-Runtime toggle: the `/coach` command (power on/off | enable/disable evaluate|correct|
-translate | status) writes a small state file (under CLAUDE_PLUGIN_DATA / PLUGIN_DATA,
-else ~/.claude) that this hook reads on every prompt. It overrides COACH_DISABLE /
-COACH_EVALUATE / COACH_CORRECT / COACH_TRANSLATE so you can flip behavior mid-session
-with no restart.
+Runtime toggle: the `/prompt-coach:power|enable|disable|status|help` commands write a
+small state file (under CLAUDE_PLUGIN_DATA / PLUGIN_DATA, else ~/.claude) that this
+hook reads on every prompt. They override COACH_DISABLE / COACH_EVALUATE /
+COACH_CORRECT / COACH_TRANSLATE so you can flip behavior mid-session with no restart.
 
 Re-entrancy: the CLI backend's nested `codex exec` / `claude -p` call could
 re-fire UserPromptSubmit and re-invoke this hook. We set COACH_NESTED=1 on the
@@ -432,16 +431,16 @@ def detect_platform(env):
 
 
 def state_path(env):
-    """Path to the runtime state file toggled by the `/coach` command.
+    """Path to the runtime state file toggled by the `/prompt-coach:*` command.
 
     Scope (env COACH_STATE_SCOPE):
       - "global" (default): one shared file — a toggle affects every session.
       - "project": keyed by CLAUDE_PROJECT_DIR / PROJECT_DIR (a stable per-project
         filename suffix), so different projects are independent. Both the hook and
-        the `/coach` command see that env var, so they compute the same path.
+        the `/prompt-coach:*` command see that env var, so they compute the same path.
 
     True per-session scope is not offered: the platform exposes session_id only in
-    the hook's stdin payload, not as an env var, so the `/coach` command (a plain
+    the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
     subprocess) has no reliable way to learn which session it is in.
 
     The file always lives in the plugin data dir (CLAUDE_PLUGIN_DATA / PLUGIN_DATA,
@@ -497,7 +496,7 @@ def load_config(env):
         bool(native_explicit)
         and native.strip().lower() == target.strip().lower()
     )
-    # Every coaching feature is an independent on/off switch, written by `/coach`
+    # Every coaching feature is an independent on/off switch, written by `/prompt-coach:*`
     # to the state file (which overrides the env defaults). The language axis has
     # two such switches — correction and translation — that may BOTH be on:
     #   correct only  -> correct TARGET-language writing        (lang_mode "correct")
@@ -757,8 +756,8 @@ def gate_axes(analysis, cfg):
     """Zero out whichever coaching axes are off.
 
     The language axis is off when native==target (nothing to coach) OR the user
-    turned it off (`/coach disable correct translate`). The prompt (evaluate) axis is
-    off when the user ran `/coach disable evaluate`. Returns the analysis unchanged
+    turned it off (`/prompt-coach:disable correct translate`). The prompt (evaluate) axis is
+    off when the user ran `/prompt-coach:disable evaluate`. Returns the analysis unchanged
     when both are on.
     """
     lang_on = cfg.get("coach_language", True) and cfg.get("axis_language", True)
@@ -975,12 +974,12 @@ _FEATURES = {
     "translate": "translate",  # render native-language input in the target
 }
 _CTL_USAGE = (
-    "prompt-coach — /coach <action>\n"
-    "  power on | power off          the whole hook\n"
-    "  enable  <evaluate|correct|translate ...>   turn feature(s) on\n"
-    "  disable <evaluate|correct|translate ...>   turn feature(s) off\n"
-    "  status                        show current state\n"
-    "  help                          show this usage\n"
+    "prompt-coach — commands:\n"
+    "  /prompt-coach:power on | off\n"
+    "  /prompt-coach:enable  <evaluate|correct|translate ...>\n"
+    "  /prompt-coach:disable <evaluate|correct|translate ...>\n"
+    "  /prompt-coach:status\n"
+    "  /prompt-coach:help\n"
     "Features: evaluate (prompt quality), correct (fix target-language writing),\n"
     "          translate (render native-language input in the target language).\n"
     "correct + translate both on = auto: correct target input, translate native.\n"
@@ -988,7 +987,7 @@ _CTL_USAGE = (
 
 
 def _control(argv, env):
-    """Handle `--ctl <action ...>` from the `/coach` command. Returns exit code.
+    """Handle `--ctl <action ...>` from the `/prompt-coach:*` command. Returns exit code.
 
     Appliance-style master switch plus enable/disable verbs (space, hyphen, or
     comma all separate tokens, so "disable correct,translate" works):
@@ -1094,7 +1093,7 @@ def dry_run(argv):
 
 
 def main():
-    # Control surface for the `/coach` command (toggle on/off, switch mode).
+    # Control surface for the `/prompt-coach:*` command (toggle on/off, switch mode).
     if "--ctl" in sys.argv[1:]:
         sys.exit(_control(sys.argv[1:], os.environ))
 
