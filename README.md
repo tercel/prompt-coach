@@ -1,13 +1,16 @@
 # prompt-coach
 
-A shared Claude Code and Codex `UserPromptSubmit` plugin that coaches:
+A `UserPromptSubmit` plugin for **Claude Code and Codex** that coaches every
+prompt, two ways:
 
-1. **Prompt quality**: rewrites prompts into clearer coding instructions.
-2. **Target language**: identifies expression issues and provides a natural
-   rewrite in the language being practiced.
+1. **Prompt quality** — rewrites your prompt into a clearer coding instruction,
+   plus one teaching tip.
+2. **Target language** — corrects your writing in the language you're practicing,
+   or translates a native-language prompt into it — each with a short explanation.
 
-The same analysis core, Hook configuration, and environment variables work in
-both agents. Clean prompts and backend failures pass through silently.
+One analysis core, hook config, and environment variables across both agents.
+Each feature toggles live with `/coach` (no restart). Clean prompts and backend
+failures pass through silently.
 
 ## Supported platforms and backends
 
@@ -243,6 +246,10 @@ COACH_PLATFORM=claude python3 scripts/coach.py --dry-run "review this prompt"
 # Force a specific backend.
 COACH_BACKEND=openai python3 scripts/coach.py --dry-run "review this prompt"
 COACH_BACKEND=anthropic python3 scripts/coach.py --dry-run "review this prompt"
+
+# Translate mode: write in your native language, get a target-language version.
+COACH_CORRECT=off COACH_TRANSLATE=on COACH_NATIVE_LANG=Chinese \
+  python3 scripts/coach.py --dry-run "帮我修复登录时 token 过期的 bug"
 ```
 
 ## Develop and test
