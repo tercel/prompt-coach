@@ -289,6 +289,60 @@ class TestLangModeAndState(unittest.TestCase):
         self.assertIn("指令", coach._CTL_USAGE_ZH)
         self.assertNotIn("指令", coach._CTL_USAGE)
 
+    def test_control_lang_sets_native_and_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(
+                coach._control(["--ctl", "lang", "native", "Chinese", "target", "English"], env),
+                0,
+            )
+            cfg = coach.load_config(env)
+            self.assertEqual(cfg["native"], "Chinese")   # case preserved
+            self.assertEqual(cfg["target"], "English")
+
+    def test_lang_accepts_codes_and_aliases(self):
+        self.assertEqual(coach.normalize_language("zh"), "Chinese")
+        self.assertEqual(coach.normalize_language("en"), "English")
+        self.assertEqual(coach.normalize_language("ja"), "Japanese")
+        self.assertEqual(coach.normalize_language("jp"), "Japanese")   # alias
+        self.assertEqual(coach.normalize_language("kr"), "Korean")
+        self.assertEqual(coach.normalize_language("english"), "English")  # case
+        self.assertEqual(coach.normalize_language("Swahili"), "Swahili")  # passthrough
+
+    def test_control_lang_with_codes(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "lang", "native", "zh", "target", "en"], env)
+            cfg = coach.load_config(env)
+            self.assertEqual(cfg["native"], "Chinese")
+            self.assertEqual(cfg["target"], "English")
+
+    def test_control_lang_single_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "lang", "native", "Japanese"], env)
+            self.assertEqual(coach.load_config(env)["native"], "Japanese")
+            self.assertEqual(coach.load_config(env)["target"], "English")  # untouched
+
+    def test_lang_state_overrides_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_NATIVE_LANG="French")
+            coach._control(["--ctl", "lang", "native", "Korean"], env)
+            self.assertEqual(coach.load_config(env)["native"], "Korean")
+
+    def test_lang_native_equals_target_suppresses_language_axis(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "lang", "native", "English", "target", "English"], env)
+            self.assertFalse(coach.load_config(env)["coach_language"])
+
+    def test_control_lang_requires_valid_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "lang"], self._env(d)), 2)
+            self.assertEqual(
+                coach._control(["--ctl", "lang", "foo", "bar"], self._env(d)), 2
+            )
+
     def test_help_states_letter_and_full_name(self):
         # Help must make clear both the full name and the single letter work.
         for usage in (coach._CTL_USAGE, coach._CTL_USAGE_ZH):

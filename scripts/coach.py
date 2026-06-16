@@ -396,6 +396,31 @@ _LANG_NAMES = {
     "nb": "Norwegian", "no": "Norwegian", "ms": "Malay", "bn": "Bengali",
 }
 
+# Common everyday aliases beyond strict ISO 639-1 (what people actually type).
+_LANG_ALIASES = {
+    "jp": "Japanese", "kr": "Korean", "cn": "Chinese",
+    "zh-cn": "Chinese", "zh_cn": "Chinese", "ua": "Ukrainian",
+}
+# Canonical full names by lowercase, so "english"/"chinese" normalize to title case.
+_LANG_FULLNAMES = {name.lower(): name for name in _LANG_NAMES.values()}
+
+
+def normalize_language(value):
+    """Map a language code/alias/full-name to a canonical English name.
+
+    Accepts ISO codes (`zh`/`en`/`ja`), common aliases (`jp`/`kr`/`cn`), and full
+    names in any case (`english` -> `English`). Unknown values pass through as
+    typed (so any language name still works).
+    """
+    v = (value or "").strip()
+    key = v.lower()
+    return (
+        _LANG_NAMES.get(key)
+        or _LANG_ALIASES.get(key)
+        or _LANG_FULLNAMES.get(key)
+        or v
+    )
+
 
 def detect_native_language(env, default="English"):
     """Infer the user's native language from POSIX locale env vars.
@@ -484,9 +509,14 @@ def load_config(env):
         "claude", path=env.get("PATH")
     )
     shared_model = (env.get("COACH_MODEL") or "").strip()
-    target = env.get("COACH_TARGET_LANG", "English")
-    native_explicit = env.get("COACH_NATIVE_LANG")
-    native = native_explicit or detect_native_language(env)
+    # The state file (written by `/prompt-coach:*`) overrides env defaults for the
+    # things the in-session commands control: power, the feature switches, and the
+    # native/target languages.
+    state = load_state(env)
+    # native/target: state (set via `/prompt-coach:lang`) > env > (native: locale).
+    target = (state.get("target") or env.get("COACH_TARGET_LANG") or "English").strip()
+    native_explicit = state.get("native") or env.get("COACH_NATIVE_LANG")
+    native = (native_explicit or detect_native_language(env)).strip()
     # Disable the language axis ONLY when the user EXPLICITLY declares their native
     # language to equal the target (a native practicing their own tongue — nothing
     # to correct). If native is merely auto-detected and happens to match the
@@ -496,14 +526,12 @@ def load_config(env):
         bool(native_explicit)
         and native.strip().lower() == target.strip().lower()
     )
-    # Every coaching feature is an independent on/off switch, written by `/prompt-coach:*`
-    # to the state file (which overrides the env defaults). The language axis has
-    # two such switches — correction and translation — that may BOTH be on:
+    # The language axis has two switches — correction and translation — that may
+    # BOTH be on:
     #   correct only  -> correct TARGET-language writing        (lang_mode "correct")
     #   translate only-> render NATIVE-language input in TARGET (lang_mode "translate")
     #   both on       -> do whichever fits each prompt          (lang_mode "auto")
     #   both off      -> language axis silent
-    state = load_state(env)
     disabled = _flag(env.get("COACH_DISABLE", ""))
     if "enabled" in state:                 # explicit toggle wins over env
         disabled = not bool(state["enabled"])
@@ -995,6 +1023,7 @@ _CTL_USAGE = (
     "  /prompt-coach:power on | off\n"
     "  /prompt-coach:enable  <evaluate|correct|translate ...>\n"
     "  /prompt-coach:disable <evaluate|correct|translate ...>\n"
+    "  /prompt-coach:lang native <X> target <Y>   (set languages; name or code, e.g. native zh target en)\n"
     "  /prompt-coach:status\n"
     "  /prompt-coach:help [en|zh]\n"
     "Features — give the FULL NAME or its single LETTER (both accepted, mixable):\n"
@@ -1010,6 +1039,7 @@ _CTL_USAGE_ZH = (
     "  /prompt-coach:power on | off        总开关(开/关整个 hook)\n"
     "  /prompt-coach:enable  <功能 ...>     打开一个或多个功能\n"
     "  /prompt-coach:disable <功能 ...>     关闭一个或多个功能\n"
+    "  /prompt-coach:lang native <母语> target <练的语言>   设置语言(全名或代码,如 native zh target en)\n"
     "  /prompt-coach:status                查看当前状态\n"
     "  /prompt-coach:help [en|zh]          查看用法(语言,默认 en)\n"
     "功能 —— 用「全名」或「单字母」均可(可混用):\n"
@@ -1045,7 +1075,8 @@ def _control(argv, env):
     if not tokens:
         tokens = ["status"]
     action = tokens[0].lower()
-    rest = [t.lower() for t in tokens[1:]]
+    rest_raw = tokens[1:]                      # original case (for language values)
+    rest = [t.lower() for t in rest_raw]
 
     if action in ("help", "h"):   # also matches -h / --help (hyphens stripped above)
         lang = rest[0] if rest else "en"
@@ -1067,6 +1098,19 @@ def _control(argv, env):
         for feature in resolved:
             if feature is not None:   # always true after the guard above
                 state[_FEATURES[feature]] = (action == "enable")
+    elif action == "lang":
+        # `lang native <X> target <Y>` — either or both, order-free.
+        i, updates = 0, {}
+        while i + 1 < len(rest):
+            if rest[i] in ("native", "target"):
+                updates[rest[i]] = normalize_language(rest_raw[i + 1])
+                i += 2
+            else:
+                break
+        if not updates or i != len(rest):           # leftover/unknown tokens
+            sys.stderr.write(_CTL_USAGE)
+            return 2
+        state.update(updates)
     elif action != "status":
         sys.stderr.write(_CTL_USAGE)
         return 2
