@@ -44,11 +44,11 @@ emit() {  # name  argument_hint  description  ctl_verb  pass_args(0/1)
   echo "wrote $file"
 }
 
-emit power    "[on|off]"                        "prompt-coach: turn the whole hook on/off"            power    1
-emit enable   "[evaluate|correct|translate ...]" "prompt-coach: enable coaching feature(s)"           enable   1
-emit disable  "[evaluate|correct|translate ...]" "prompt-coach: disable coaching feature(s)"          disable  1
-emit status   ""                                 "prompt-coach: show current state"                   status   0
-emit help     ""                                 "prompt-coach: show command usage"                   help     0
+emit power    "[on|off]"                        "prompt-coach: turn the whole hook on/off"                       power    1
+emit enable   "[evaluate|correct|translate ...]" "prompt-coach: enable feature(s) (abbrev e|c|t ok)"          enable   1
+emit disable  "[evaluate|correct|translate ...]" "prompt-coach: disable feature(s) (abbrev e|c|t ok)"         disable  1
+emit status   ""                                 "prompt-coach: show current state"                               status   0
+emit help     "[en|zh]"                          "prompt-coach: show command usage (en|zh, default en)"           help     1
 
 echo
 echo "Done. In Codex, invoke e.g.  \$prompt-coach-enable translate"

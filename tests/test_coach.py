@@ -255,6 +255,48 @@ class TestLangModeAndState(unittest.TestCase):
                 coach._control(["--ctl", "enable", "bogus"], self._env(d)), 2
             )
 
+    def test_feature_abbreviations(self):
+        self.assertEqual(coach._resolve_feature("e"), "evaluate")
+        self.assertEqual(coach._resolve_feature("c"), "correct")
+        self.assertEqual(coach._resolve_feature("t"), "translate")
+        self.assertEqual(coach._resolve_feature("translate"), "translate")
+        self.assertEqual(coach._resolve_feature("EVALUATE"), "evaluate")
+        # Only single letters / full names — multi-letter prefixes are not aliases.
+        self.assertIsNone(coach._resolve_feature("ev"))
+        self.assertIsNone(coach._resolve_feature("en"))
+        self.assertIsNone(coach._resolve_feature("x"))
+
+    def test_control_enable_with_letters(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            self.assertEqual(coach._control(["--ctl", "enable", "c", "t"], env), 0)
+            cfg = coach.load_config(env)
+            self.assertTrue(cfg["correct_on"])
+            self.assertTrue(cfg["translate_on"])
+            self.assertEqual(coach._control(["--ctl", "disable", "e"], env), 0)
+            self.assertFalse(coach.load_config(env)["evaluate_on"])
+
+    def test_control_enable_unknown_token_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "enable", "en"], self._env(d)), 2)
+
+    def test_help_language(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            for lang in ([], ["en"]):
+                self.assertEqual(coach._control(["--ctl", "help", *lang], env), 0)
+            self.assertEqual(coach._control(["--ctl", "help", "zh"], env), 0)
+        self.assertIn("指令", coach._CTL_USAGE_ZH)
+        self.assertNotIn("指令", coach._CTL_USAGE)
+
+    def test_help_states_letter_and_full_name(self):
+        # Help must make clear both the full name and the single letter work.
+        for usage in (coach._CTL_USAGE, coach._CTL_USAGE_ZH):
+            self.assertIn("enable c t", usage)
+            self.assertIn("enable correct translate", usage)
+            for letter in ("= e", "= c", "= t"):
+                self.assertIn(letter, usage)
+
     def test_env_feature_override(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = coach.load_config(self._env(d, COACH_EVALUATE="off"))

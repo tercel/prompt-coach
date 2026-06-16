@@ -973,16 +973,51 @@ _FEATURES = {
     "correct": "correct",      # correct target-language writing
     "translate": "translate",  # render native-language input in the target
 }
+
+_ZH_LANGS = ("zh", "zh-cn", "zh_cn", "cn", "chinese", "中文")
+
+# Accept the full feature name or its single-letter code (e|c|t). Deliberately
+# small — three features with distinct initials; no plan to add more.
+_FEATURE_ALIASES = {
+    "e": "evaluate", "evaluate": "evaluate",
+    "c": "correct", "correct": "correct",
+    "t": "translate", "translate": "translate",
+}
+
+
+def _resolve_feature(token):
+    """Resolve a feature token (full name or e|c|t) to its canonical name."""
+    return _FEATURE_ALIASES.get((token or "").strip().lower())
+
+
 _CTL_USAGE = (
     "prompt-coach — commands:\n"
     "  /prompt-coach:power on | off\n"
     "  /prompt-coach:enable  <evaluate|correct|translate ...>\n"
     "  /prompt-coach:disable <evaluate|correct|translate ...>\n"
     "  /prompt-coach:status\n"
-    "  /prompt-coach:help\n"
-    "Features: evaluate (prompt quality), correct (fix target-language writing),\n"
-    "          translate (render native-language input in the target language).\n"
+    "  /prompt-coach:help [en|zh]\n"
+    "Features — give the FULL NAME or its single LETTER (both accepted, mixable):\n"
+    "  evaluate  = e  — prompt-quality coaching\n"
+    "  correct   = c  — fix target-language writing\n"
+    "  translate = t  — render native-language input in the target language\n"
+    "e.g.  enable c t   ==   enable correct translate\n"
     "correct + translate both on = auto: correct target input, translate native.\n"
+)
+
+_CTL_USAGE_ZH = (
+    "prompt-coach — 指令:\n"
+    "  /prompt-coach:power on | off        总开关(开/关整个 hook)\n"
+    "  /prompt-coach:enable  <功能 ...>     打开一个或多个功能\n"
+    "  /prompt-coach:disable <功能 ...>     关闭一个或多个功能\n"
+    "  /prompt-coach:status                查看当前状态\n"
+    "  /prompt-coach:help [en|zh]          查看用法(语言,默认 en)\n"
+    "功能 —— 用「全名」或「单字母」均可(可混用):\n"
+    "  evaluate  = e  — prompt 质量建议\n"
+    "  correct   = c  — 纠正你的目标语言写作\n"
+    "  translate = t  — 把母语输入翻成目标语言\n"
+    "例:enable c t   等同   enable correct translate\n"
+    "correct 与 translate 同时开 = 自动:打目标语就纠错,打母语就翻译。\n"
 )
 
 
@@ -1013,7 +1048,8 @@ def _control(argv, env):
     rest = [t.lower() for t in tokens[1:]]
 
     if action in ("help", "h"):   # also matches -h / --help (hyphens stripped above)
-        sys.stdout.write(_CTL_USAGE)
+        lang = rest[0] if rest else "en"
+        sys.stdout.write(_CTL_USAGE_ZH if lang in _ZH_LANGS else _CTL_USAGE)
         return 0
 
     state = load_state(env)
@@ -1024,11 +1060,13 @@ def _control(argv, env):
             return 2
         state["enabled"] = val
     elif action in ("enable", "disable"):
-        if not rest or any(f not in _FEATURES for f in rest):
+        resolved = [_resolve_feature(f) for f in rest]
+        if not rest or any(r is None for r in resolved):
             sys.stderr.write(_CTL_USAGE)
             return 2
-        for feature in rest:
-            state[_FEATURES[feature]] = (action == "enable")
+        for feature in resolved:
+            if feature is not None:   # always true after the guard above
+                state[_FEATURES[feature]] = (action == "enable")
     elif action != "status":
         sys.stderr.write(_CTL_USAGE)
         return 2

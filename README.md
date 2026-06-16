@@ -191,9 +191,11 @@ with no restart — taking effect on your next prompt:
 | `/prompt-coach:status` | Show current state (each feature, scope, state-file path) |
 | `/prompt-coach:help` | Show the command usage |
 
-**Features:** `evaluate` (prompt-quality coaching) · `correct` (fix your
-*target-language* writing) · `translate` (render *native-language* input in the
-target language).
+**Features** (use the full name or its single letter `e` · `c` · `t`):
+`evaluate` (prompt-quality coaching) · `correct` (fix your *target-language*
+writing) · `translate` (render *native-language* input in the target language).
+So `/prompt-coach:enable c t` == `… enable correct translate`. `/prompt-coach:help
+zh` shows the usage in Chinese (`en` default).
 
 You can pass several at once: `/prompt-coach:enable correct translate` (= auto:
 correct what you write in the target language, translate what you write in your
