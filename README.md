@@ -134,8 +134,8 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_TARGET_LANG` | `English` | Language being practiced. |
 | `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
 | `COACH_LEVEL` | `Advanced` | Feedback depth. |
-| `COACH_EVALUATE` | `on` | Prompt-quality coaching on/off. Overridden live by `/prompt-coach:enable|disable evaluate`. |
-| `COACH_CORRECT` | `on` | Target-language correction on/off. Overridden live by `/prompt-coach:enable|disable correct`. |
+| `COACH_EVALUATE` | `off` | Prompt-quality coaching on/off. Overridden live by `/prompt-coach:enable|disable evaluate`. |
+| `COACH_CORRECT` | `off` | Target-language correction on/off. Overridden live by `/prompt-coach:enable|disable correct`. |
 | `COACH_TRANSLATE` | `off` | Native→target translation on/off. Overridden live by `/prompt-coach:enable|disable translate`. |
 | `COACH_STATE_SCOPE` | `global` | `global` or `project` — how widely a `/prompt-coach:*` toggle applies. |
 | `COACH_STATE_DIR` | `~/.claude/prompt-coach` | Directory for the runtime state file. |
@@ -212,11 +212,13 @@ correct what you write in the target language, translate what you write in your
 native one); `/prompt-coach:disable correct translate` turns all language coaching
 off. Separators are flexible — space, comma, or hyphen (`disable correct,translate`).
 
-Defaults: hook on, `evaluate` on, `correct` on, `translate` off. So a Chinese speaker
-practicing English: type English for corrections (default); `/prompt-coach:enable
-translate` to also get an English version when you type Chinese; `/prompt-coach:disable
-correct` to keep only translation; `/prompt-coach:disable evaluate` to silence
-prompt-quality tips.
+**Opt-in by default: all features start OFF** — a fresh install does nothing (and
+when everything is off the hook exits before any model call). Turn on what you want:
+a Chinese speaker practicing English might `/prompt-coach:enable correct translate`
+(correct your English, translate your Chinese), or just `/prompt-coach:enable evaluate`
+for prompt-quality tips only. Set this per project with `.claude/settings.local.json`
+(`COACH_EVALUATE`/`COACH_CORRECT`/`COACH_TRANSLATE` env) so each project opts in
+independently.
 
 ### Codex
 
@@ -263,6 +265,35 @@ How widely a `/prompt-coach:*` toggle reaches:
 **Per-session scope is not offered.** The platform exposes `session_id` only in the
 hook's stdin payload, not as an env var, so the `/prompt-coach:*` commands (a plain subprocess)
 can't know which session it's in. `project` is the finest reliable granularity; `/prompt-coach:status` prints the active scope and the exact state-file path.
+
+### Per-project opt-in (recommended)
+
+Because everything is **off by default**, the cleanest setup is to enable coaching
+only in the projects where you want it, via that project's
+`.claude/settings.local.json` (personal, gitignored):
+
+```json
+{
+  "env": {
+    "COACH_NATIVE_LANG": "Chinese",
+    "COACH_TARGET_LANG": "English",
+    "COACH_CORRECT": "on",
+    "COACH_TRANSLATE": "on"
+  }
+}
+```
+
+- Project settings **override the global defaults**, so this works even with **no
+  global config** — a project sets what it wants; precedence is project
+  `settings.local.json` > global `settings.json` > built-in default (off).
+- Projects *without* this file get nothing (default off) — and the hook exits
+  before any model call, so it's zero-cost there.
+- This env approach is inherently per-project, so you don't need
+  `COACH_STATE_SCOPE` or the `/prompt-coach:*` commands here — use the commands
+  instead when you want to toggle a feature **live** within a session.
+
+A global `~/.claude/settings.json` `env` is optional — put machine-wide defaults
+there (e.g. `COACH_NATIVE_LANG`), and any project can still override them.
 
 ## Delivery modes
 

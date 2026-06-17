@@ -159,13 +159,14 @@ class TestLangModeAndState(unittest.TestCase):
         env.update(extra)
         return env
 
-    def test_defaults_correct_on_translate_off(self):
+    def test_defaults_all_off_optin(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = coach.load_config(self._env(d))
-            self.assertTrue(cfg["correct_on"])
+            self.assertFalse(cfg["evaluate_on"])
+            self.assertFalse(cfg["correct_on"])
             self.assertFalse(cfg["translate_on"])
-            self.assertEqual(cfg["lang_mode"], "correct")
-            self.assertTrue(cfg["axis_language"])
+            self.assertFalse(cfg["axis_language"])
+            self.assertFalse(coach._anything_to_coach(cfg))  # nothing to do
 
     def test_translate_only_derives_translate_mode(self):
         with tempfile.TemporaryDirectory() as d:
@@ -176,7 +177,9 @@ class TestLangModeAndState(unittest.TestCase):
 
     def test_both_on_derives_auto_mode(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = coach.load_config(self._env(d, COACH_TRANSLATE="on"))
+            cfg = coach.load_config(
+                self._env(d, COACH_CORRECT="on", COACH_TRANSLATE="on")
+            )
             self.assertTrue(cfg["correct_on"])
             self.assertTrue(cfg["translate_on"])
             self.assertEqual(cfg["lang_mode"], "auto")
@@ -283,24 +286,38 @@ class TestLangModeAndState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(coach._control(["--ctl", "bogus"], self._env(d)), 2)
 
-    def test_features_default_on(self):
+    def test_features_default_off(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = coach.load_config(self._env(d))
-            self.assertTrue(cfg["evaluate_on"])
-            self.assertTrue(cfg["correct_on"])
+            self.assertFalse(cfg["evaluate_on"])
+            self.assertFalse(cfg["correct_on"])
+
+    def test_anything_to_coach(self):
+        # Single source of truth for the early-exit: any one axis on -> True.
+        off = {"coach_language": True, "axis_language": False, "evaluate_on": False}
+        self.assertFalse(coach._anything_to_coach(off))
+        self.assertTrue(coach._anything_to_coach({**off, "evaluate_on": True}))
+        self.assertTrue(coach._anything_to_coach({**off, "axis_language": True}))
+        # native==target disables the language axis even if a switch is on
+        self.assertFalse(
+            coach._anything_to_coach(
+                {"coach_language": False, "axis_language": True, "evaluate_on": False}
+            )
+        )
 
     def test_disable_evaluate_independently(self):
         with tempfile.TemporaryDirectory() as d:
             env = self._env(d)
+            coach._control(["--ctl", "enable", "evaluate", "correct"], env)
             self.assertEqual(coach._control(["--ctl", "disable", "evaluate"], env), 0)
             cfg = coach.load_config(env)
             self.assertFalse(cfg["evaluate_on"])
-            self.assertTrue(cfg["axis_language"])  # language untouched
+            self.assertTrue(cfg["axis_language"])  # language (correct) untouched
 
     def test_enable_disable_correct_and_translate_independent(self):
         with tempfile.TemporaryDirectory() as d:
             env = self._env(d)
-            coach._control(["--ctl", "enable", "translate"], env)
+            coach._control(["--ctl", "enable", "evaluate", "translate"], env)
             coach._control(["--ctl", "disable", "correct"], env)
             cfg = coach.load_config(env)
             self.assertFalse(cfg["correct_on"])
@@ -428,6 +445,20 @@ class TestLangModeAndState(unittest.TestCase):
             self.assertEqual(
                 coach._control(["--ctl", "lang", "foo", "bar"], self._env(d)), 2
             )
+
+    def test_command_syntax_is_platform_aware(self):
+        # Claude shows /prompt-coach:enable ; Codex shows $prompt-coach-enable.
+        self.assertEqual(
+            coach._cmd({"CLAUDE_PLUGIN_ROOT": "/x"}, "enable correct"),
+            "/prompt-coach:enable correct",
+        )
+        self.assertEqual(
+            coach._cmd({"PLUGIN_ROOT": "/x"}, "enable correct"),
+            "$prompt-coach-enable correct",
+        )
+        # The whole usage text follows suit.
+        self.assertIn("$prompt-coach-power", coach._usage({"PLUGIN_ROOT": "/x"}))
+        self.assertIn("/prompt-coach:power", coach._usage({"CLAUDE_PLUGIN_ROOT": "/x"}))
 
     def test_help_states_letter_and_full_name(self):
         # Help must make clear both the full name and the single letter work.
@@ -924,7 +955,8 @@ class TestLanguageGate(unittest.TestCase):
 
     def test_gate_zeros_language_axis(self):
         cfg = coach.load_config(
-            {"COACH_NATIVE_LANG": "English", "COACH_TARGET_LANG": "English"}
+            {"COACH_NATIVE_LANG": "English", "COACH_TARGET_LANG": "English",
+             "COACH_EVALUATE": "on"}  # evaluate on so the prompt axis survives
         )
         gated = coach.gate_language(make_analysis(True, True), cfg)
         self.assertFalse(gated["language"]["has_issues"])
@@ -934,7 +966,8 @@ class TestLanguageGate(unittest.TestCase):
 
     def test_gate_noop_when_enabled(self):
         cfg = coach.load_config(
-            {"COACH_NATIVE_LANG": "Chinese", "COACH_TARGET_LANG": "English"}
+            {"COACH_NATIVE_LANG": "Chinese", "COACH_TARGET_LANG": "English",
+             "COACH_EVALUATE": "on", "COACH_CORRECT": "on"}  # both axes on
         )
         analysis = make_analysis(True, True)
         self.assertIs(coach.gate_language(analysis, cfg), analysis)

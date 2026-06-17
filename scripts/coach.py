@@ -48,9 +48,11 @@ Configuration (environment variables):
   COACH_CLI_MODEL          override only the Codex CLI model
   COACH_API_MODEL          override only the OpenAI API model
   COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
-  Coaching features — each independent on/off, overridden live by `/prompt-coach:*`:
-  COACH_EVALUATE           on/off (default on) — prompt-quality coaching
-  COACH_CORRECT            on/off (default on) — correct TARGET-language writing
+  Coaching features — each independent on/off, overridden live by `/prompt-coach:*`.
+  ALL default OFF (opt-in): a freshly-installed plugin does nothing until you turn
+  a feature on (and when all are off the hook exits before any model call).
+  COACH_EVALUATE           on/off (default off) — prompt-quality coaching
+  COACH_CORRECT            on/off (default off) — correct TARGET-language writing
   COACH_TRANSLATE          on/off (default off) — render NATIVE input in TARGET
                            correct + translate may BOTH be on (= auto: correct
                            target-language input, translate native input).
@@ -554,8 +556,10 @@ def load_config(env):
     disabled = _flag(env.get("COACH_DISABLE", ""))
     if "enabled" in state:                 # explicit toggle wins over env
         disabled = not bool(state["enabled"])
-    evaluate_on = _axis_flag(state.get("evaluate"), env.get("COACH_EVALUATE"), True)
-    correct_on = _axis_flag(state.get("correct"), env.get("COACH_CORRECT"), True)
+    # Opt-in by default: everything OFF until the user enables a feature (per env
+    # or `/prompt-coach:enable`). A freshly-installed plugin does nothing.
+    evaluate_on = _axis_flag(state.get("evaluate"), env.get("COACH_EVALUATE"), False)
+    correct_on = _axis_flag(state.get("correct"), env.get("COACH_CORRECT"), False)
     translate_on = _axis_flag(state.get("translate"), env.get("COACH_TRANSLATE"), False)
     axis_language = correct_on or translate_on
     if correct_on and translate_on:
@@ -842,6 +846,25 @@ def _system(cfg, prompt=""):
     return base
 
 
+def _active_axes(cfg):
+    """The coaching axes currently ON, as (prompt_on, lang_on).
+
+    SINGLE SOURCE OF TRUTH for "what's enabled" — both gate_axes() (what to keep)
+    and _anything_to_coach() (whether to call the model at all) derive from this.
+    MAINTENANCE: when you add a new coaching axis, add its flag here; forgetting
+    to also gate it in gate_axes() would be obvious (it wouldn't be zeroed), so
+    the early-exit optimization can't silently drop a new axis.
+    """
+    lang_on = cfg.get("coach_language", True) and cfg.get("axis_language", False)
+    prompt_on = cfg.get("evaluate_on", False)
+    return prompt_on, lang_on
+
+
+def _anything_to_coach(cfg):
+    """True if at least one axis is on — else the hook skips the model call."""
+    return any(_active_axes(cfg))
+
+
 def gate_axes(analysis, cfg):
     """Zero out whichever coaching axes are off.
 
@@ -850,8 +873,7 @@ def gate_axes(analysis, cfg):
     off when the user ran `/prompt-coach:disable evaluate`. Returns the analysis unchanged
     when both are on.
     """
-    lang_on = cfg.get("coach_language", True) and cfg.get("axis_language", True)
-    prompt_on = cfg.get("evaluate_on", True)
+    prompt_on, lang_on = _active_axes(cfg)
     if lang_on and prompt_on:
         return analysis
     return {
@@ -1094,6 +1116,8 @@ _CTL_USAGE = (
     "  translate = t  — render native-language input in the target language\n"
     "e.g.  enable c t   ==   enable correct translate\n"
     "correct + translate both on = auto: correct target input, translate native.\n"
+    "Everything is OFF by default — enable what you want:\n"
+    "  /prompt-coach:enable correct translate evaluate   (pick any subset)\n"
 )
 
 _CTL_USAGE_ZH = (
@@ -1110,7 +1134,24 @@ _CTL_USAGE_ZH = (
     "  translate = t  — 把母语输入翻成目标语言\n"
     "例:enable c t   等同   enable correct translate\n"
     "correct 与 translate 同时开 = 自动:打目标语就纠错,打母语就翻译。\n"
+    "默认全部关闭 —— 按需开启:\n"
+    "  /prompt-coach:enable correct translate evaluate   (任选其一或多个)\n"
 )
+
+
+def _cmd(env, rest):
+    """Render a command reference in the active platform's syntax:
+    Claude `/prompt-coach:enable …`  ·  Codex `$prompt-coach-enable …`."""
+    pre = "$prompt-coach-" if detect_platform(env) == "codex" else "/prompt-coach:"
+    return pre + rest
+
+
+def _usage(env, zh=False):
+    """Usage text with command references in the active platform's syntax."""
+    text = _CTL_USAGE_ZH if zh else _CTL_USAGE
+    if detect_platform(env) == "codex":
+        text = text.replace("/prompt-coach:", "$prompt-coach-")
+    return text
 
 
 def _control(argv, env):
@@ -1142,20 +1183,20 @@ def _control(argv, env):
 
     if action in ("help", "h"):   # also matches -h / --help (hyphens stripped above)
         lang = rest[0] if rest else "en"
-        sys.stdout.write(_CTL_USAGE_ZH if lang in _ZH_LANGS else _CTL_USAGE)
+        sys.stdout.write(_usage(env, zh=lang in _ZH_LANGS))
         return 0
 
     state = load_state(env)
     if action == "power":
         val = _onoff(rest[0] if rest else None)
         if val is None:
-            sys.stderr.write(_CTL_USAGE)
+            sys.stderr.write(_usage(env))
             return 2
         state["enabled"] = val
     elif action in ("enable", "disable"):
         resolved = [_resolve_feature(f) for f in rest]
         if not rest or any(r is None for r in resolved):
-            sys.stderr.write(_CTL_USAGE)
+            sys.stderr.write(_usage(env))
             return 2
         for feature in resolved:
             if feature is not None:   # always true after the guard above
@@ -1170,11 +1211,11 @@ def _control(argv, env):
             else:
                 break
         if not updates or i != len(rest):           # leftover/unknown tokens
-            sys.stderr.write(_CTL_USAGE)
+            sys.stderr.write(_usage(env))
             return 2
         state.update(updates)
     elif action != "status":
-        sys.stderr.write(_CTL_USAGE)
+        sys.stderr.write(_usage(env))
         return 2
 
     if action != "status":
@@ -1208,6 +1249,14 @@ def _control(argv, env):
         "native %s, practicing %s | scope: %s | state file: %s"
         % (cfg["native"], cfg["target"], scope, state_path(env))
     )
+    # Guide a new user out of the all-off default state.
+    if cfg["disabled"]:
+        print("hook is OFF — turn it on: " + _cmd(env, "power on"))
+    elif not _anything_to_coach(cfg):
+        print(
+            "nothing enabled — enable what you want: "
+            + _cmd(env, "enable correct translate evaluate")
+        )
     return 0
 
 
@@ -1263,6 +1312,8 @@ def main():
 
     cfg = load_config(os.environ)
     if cfg["disabled"] or not backend_available(cfg):
+        sys.exit(0)
+    if not _anything_to_coach(cfg):   # all axes off -> nothing to do, no model call
         sys.exit(0)
 
     prompt = event.get("prompt", "")
