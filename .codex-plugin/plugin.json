@@ -1,6 +1,6 @@
 {
   "name": "prompt-coach",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Dual-axis coaching on every Codex prompt: improves prompt quality and target-language expression.",
   "author": {
     "name": "tercel"
