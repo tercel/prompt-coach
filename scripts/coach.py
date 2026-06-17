@@ -70,14 +70,14 @@ Configuration (environment variables):
                            project = isolated per CLAUDE_PROJECT_DIR. (Per-session
                            is not possible — see state_path().)
   COACH_STATE_DIR          dir for the runtime state file (default:
-                           ~/.claude/prompt-coach). Must NOT depend on
-                           CLAUDE_PLUGIN_DATA — that differs between the hook and
-                           the /prompt-coach command, which would desync them.
+                           ~/.config/prompt-coach). Must NOT depend on
+                           CLAUDE_PLUGIN_DATA / PLUGIN_DATA — those differ between
+                           the hook and the control command, which would desync them.
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
 
 Runtime toggle: the `/prompt-coach:power|enable|disable|status|help` commands write a
-small state file (~/.claude/prompt-coach/, fixed home path — see state_path)
+small state file in prompt-coach's fixed home path (see state_path())
 that this hook reads on every prompt. They override COACH_DISABLE / COACH_EVALUATE /
 COACH_CORRECT / COACH_TRANSLATE so you can flip behavior mid-session with no restart.
 
@@ -475,16 +475,18 @@ def state_path(env):
     the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
     subprocess) has no reliable way to learn which session it is in.
 
-    Location: a FIXED home dir (`~/.claude/prompt-coach/`, overridable with
-    COACH_STATE_DIR) — a dedicated folder so project-scoped files don't litter
-    ~/.claude. It must NOT depend on CLAUDE_PLUGIN_DATA / PLUGIN_DATA: those are
-    set for the hook but NOT for the `/prompt-coach:*` command subprocess, so
-    keying off them makes the command and the hook read different files — the
-    command's toggles would silently never reach the hook. HOME is in both.
+    Location: a FIXED prompt-coach home dir (`~/.config/prompt-coach/`,
+    overridable with COACH_STATE_DIR) — a dedicated folder so project-scoped
+    files don't litter the tool's host homes. It must NOT depend on
+    CLAUDE_PLUGIN_DATA / PLUGIN_DATA: those are set for the hook but NOT for the
+    `/prompt-coach:*` command subprocess, so keying off them makes the command
+    and the hook read different files — the command's toggles would silently
+    never reach the hook. HOME is in both.
     """
-    base = env.get("COACH_STATE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude", "prompt-coach"
-    )
+    if env.get("COACH_STATE_DIR"):
+        base = env["COACH_STATE_DIR"]
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config", "prompt-coach")
     name = "state.json"
     scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
     if scope == "project":

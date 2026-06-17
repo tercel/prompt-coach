@@ -138,7 +138,7 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_CORRECT` | `off` | Target-language correction on/off. Overridden live by `/prompt-coach:enable|disable correct`. |
 | `COACH_TRANSLATE` | `off` | Native→target translation on/off. Overridden live by `/prompt-coach:enable|disable translate`. |
 | `COACH_STATE_SCOPE` | `global` | `global` or `project` — how widely a `/prompt-coach:*` toggle applies. |
-| `COACH_STATE_DIR` | `~/.claude/prompt-coach` | Directory for the runtime state file. |
+| `COACH_STATE_DIR` | `~/.config/prompt-coach` | Directory for the runtime state file. |
 | `COACH_CLI_FLAGS` | unset | Extra space-separated flags for `codex exec` (Codex CLI backend). |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
 | `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
@@ -217,7 +217,7 @@ when everything is off the hook exits before any model call). Turn on what you w
 a Chinese speaker practicing English might `/prompt-coach:enable correct translate`
 (correct your English, translate your Chinese), or just `/prompt-coach:enable evaluate`
 for prompt-quality tips only. Set this per project with `.claude/settings.local.json`
-(`COACH_EVALUATE`/`COACH_CORRECT`/`COACH_TRANSLATE` env) so each project opts in
+for Claude or `.codex/config.toml` for Codex so each project opts in
 independently.
 
 ### Codex
@@ -244,14 +244,15 @@ Re-run the script after moving the repo. (The same Codex format — YAML frontma
 + `$ARGUMENTS` — is why these work; `agent-skill-bundler` only converts *skills*,
 not hook commands, so it isn't involved here.)
 
-Each toggle is written to a small state file under `~/.claude/prompt-coach/`
+Each toggle is written to a small state file under `~/.config/prompt-coach/`
 (`state.json`, or `state.<projecthash>.json` under project scope; override the dir
 with `COACH_STATE_DIR`; never inside your project) that the hook
 reads every prompt; it overrides the `COACH_EVALUATE` / `COACH_CORRECT` /
 `COACH_TRANSLATE` / `COACH_DISABLE` env defaults. The path is intentionally a fixed
-home location, **not** `CLAUDE_PLUGIN_DATA` — that variable is set for the hook but
-not for the `/prompt-coach:*` command subprocess, so keying off it would make the
-command and the hook read different files (your toggles would silently never apply).
+home location, **not** `CLAUDE_PLUGIN_DATA` / `PLUGIN_DATA` — those variables are
+set for the hook but not for the control command subprocess, so keying off them
+would make the command and the hook read different files (your toggles would
+silently never apply).
 
 ### Toggle scope (`COACH_STATE_SCOPE`)
 
@@ -269,8 +270,10 @@ can't know which session it's in. `project` is the finest reliable granularity; 
 ### Per-project opt-in (recommended)
 
 Because everything is **off by default**, the cleanest setup is to enable coaching
-only in the projects where you want it, via that project's
-`.claude/settings.local.json` (personal, gitignored):
+only in the projects where you want it.
+
+For Claude Code, use that project's `.claude/settings.local.json` (personal,
+gitignored):
 
 ```json
 {
@@ -283,17 +286,33 @@ only in the projects where you want it, via that project's
 }
 ```
 
-- Project settings **override the global defaults**, so this works even with **no
-  global config** — a project sets what it wants; precedence is project
-  `settings.local.json` > global `settings.json` > built-in default (off).
-- Projects *without* this file get nothing (default off) — and the hook exits
+For Codex, use `.codex/config.toml` in a trusted project:
+
+```toml
+[shell_environment_policy]
+set = {
+  COACH_NATIVE_LANG = "Chinese",
+  COACH_TARGET_LANG = "English",
+  COACH_CORRECT = "on",
+  COACH_TRANSLATE = "on",
+}
+```
+
+- Project settings **override the global defaults**, so this works even with no
+  global config — a project sets what it wants; built-in default remains off.
+- Codex only loads project-local `.codex/config.toml` after the project is
+  trusted. Project-local Codex config can also define hooks, but don't add a
+  second prompt-coach hook there if the plugin hook is already installed.
+- Projects without these files get nothing (default off), and the hook exits
   before any model call, so it's zero-cost there.
-- This env approach is inherently per-project, so you don't need
+- This env/config approach is inherently per-project, so you don't need
   `COACH_STATE_SCOPE` or the `/prompt-coach:*` commands here — use the commands
   instead when you want to toggle a feature **live** within a session.
 
 A global `~/.claude/settings.json` `env` is optional — put machine-wide defaults
-there (e.g. `COACH_NATIVE_LANG`), and any project can still override them.
+there (e.g. `COACH_NATIVE_LANG`), and any project can still override them. Codex
+machine-wide defaults can live in `~/.codex/config.toml` under
+`[shell_environment_policy].set`.
 
 ## Delivery modes
 

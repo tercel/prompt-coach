@@ -20,8 +20,8 @@ import coach  # type: ignore[import-not-found]  # noqa: E402  (resolved at runti
 
 
 # Point "~" at an empty temp home for the whole module so the default state path
-# (~/.claude/prompt-coach/state.json) never reads the real user's file. Tests that
-# set COACH_STATE_DIR explicitly still override this.
+# never reads the real user's file. Tests that set COACH_STATE_DIR explicitly
+# still override this.
 _FAKE_HOME = ""
 _HOME_PATCHER = None
 
@@ -192,6 +192,20 @@ class TestLangModeAndState(unittest.TestCase):
     def test_load_state_missing_returns_empty(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(coach.load_state(self._env(d)), {})
+
+    def test_default_state_dir_is_shared_across_platforms(self):
+        codex_path = coach.state_path({})
+        claude_path = coach.state_path({"CLAUDE_PLUGIN_ROOT": "/plugin"})
+        explicit_path = coach.state_path(
+            {"COACH_STATE_DIR": "/tmp/prompt-coach-state", "PLUGIN_ROOT": "/plugin"}
+        )
+
+        self.assertEqual(codex_path, claude_path)
+        self.assertIn(os.path.join(".config", "prompt-coach"), codex_path)
+        self.assertEqual(
+            explicit_path,
+            os.path.join("/tmp/prompt-coach-state", "state.json"),
+        )
 
     def test_state_scope_global_is_shared(self):
         with tempfile.TemporaryDirectory() as d:
