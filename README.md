@@ -138,6 +138,8 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_CORRECT` | `on` | Target-language correction on/off. Overridden live by `/prompt-coach:enable|disable correct`. |
 | `COACH_TRANSLATE` | `off` | Native→target translation on/off. Overridden live by `/prompt-coach:enable|disable translate`. |
 | `COACH_STATE_SCOPE` | `global` | `global` or `project` — how widely a `/prompt-coach:*` toggle applies. |
+| `COACH_STATE_DIR` | `~/.claude/prompt-coach` | Directory for the runtime state file. |
+| `COACH_CLI_FLAGS` | unset | Extra space-separated flags for `codex exec` (Codex CLI backend). |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
 | `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
 | `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
@@ -177,6 +179,11 @@ Everything that passes the filter goes to the model, which reads recent
 conversation and stays silent on context-clear follow-ups. `make`/`go` are
 treated as English words, not CLI commands, so `make it better` is coached.
 
+CJK (Chinese / Japanese / Korean) input is judged by character count, not word
+count — those scripts have no spaces, so a whole sentence like `优化这段代码的性能`
+is coached, not mistaken for a single token (only 1-character replies like `好` are
+skipped).
+
 ## Commands
 
 Claude Code namespaces plugin commands as `/<plugin>:<command>`, so each action is
@@ -188,14 +195,17 @@ with no restart — taking effect on your next prompt:
 | `/prompt-coach:power on` · `… off` | The **entire** hook on/off (feature states preserved) |
 | `/prompt-coach:enable <feature…>` | Turn one or more features **on** |
 | `/prompt-coach:disable <feature…>` | Turn one or more features **off** |
+| `/prompt-coach:lang native <X> target <Y>` | Set your native / practiced language (name or code, e.g. `native zh target en`) |
 | `/prompt-coach:status` | Show current state (each feature, scope, state-file path) |
-| `/prompt-coach:help` | Show the command usage |
+| `/prompt-coach:help [en\|zh]` | Show the command usage (English or Chinese) |
 
 **Features** (use the full name or its single letter `e` · `c` · `t`):
 `evaluate` (prompt-quality coaching) · `correct` (fix your *target-language*
 writing) · `translate` (render *native-language* input in the target language).
 So `/prompt-coach:enable c t` == `… enable correct translate`. `/prompt-coach:help
-zh` shows the usage in Chinese (`en` default).
+zh` shows the usage in Chinese (`en` default). Set your languages with
+`/prompt-coach:lang native zh target en` (full name or code; persists, overrides
+`COACH_NATIVE_LANG` / `COACH_TARGET_LANG`).
 
 You can pass several at once: `/prompt-coach:enable correct translate` (= auto:
 correct what you write in the target language, translate what you write in your
@@ -232,8 +242,9 @@ Re-run the script after moving the repo. (The same Codex format — YAML frontma
 + `$ARGUMENTS` — is why these work; `agent-skill-bundler` only converts *skills*,
 not hook commands, so it isn't involved here.)
 
-Each toggle is written to a small state file at `~/.claude/prompt-coach-state.json`
-(override the dir with `COACH_STATE_DIR`; never inside your project) that the hook
+Each toggle is written to a small state file under `~/.claude/prompt-coach/`
+(`state.json`, or `state.<projecthash>.json` under project scope; override the dir
+with `COACH_STATE_DIR`; never inside your project) that the hook
 reads every prompt; it overrides the `COACH_EVALUATE` / `COACH_CORRECT` /
 `COACH_TRANSLATE` / `COACH_DISABLE` env defaults. The path is intentionally a fixed
 home location, **not** `CLAUDE_PLUGIN_DATA` — that variable is set for the hook but

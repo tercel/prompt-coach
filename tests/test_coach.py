@@ -20,7 +20,7 @@ import coach  # type: ignore[import-not-found]  # noqa: E402  (resolved at runti
 
 
 # Point "~" at an empty temp home for the whole module so the default state path
-# (~/.claude/prompt-coach-state.json) never reads the real user's file. Tests that
+# (~/.claude/prompt-coach/state.json) never reads the real user's file. Tests that
 # set COACH_STATE_DIR explicitly still override this.
 _FAKE_HOME = ""
 _HOME_PATCHER = None
@@ -117,6 +117,41 @@ class TestShouldSkip(unittest.TestCase):
         self.assertTrue(coach.should_skip("a b", 6))      # junk below floor
         self.assertTrue(coach.should_skip("go on", 6))    # 5 chars < 6
 
+    def test_cjk_no_spaces_is_coached(self):
+        # CJK has no word spaces — a whole sentence must NOT be skipped as one token.
+        for p in (
+            "帮我修复登录时token过期的问题",   # Chinese, no spaces
+            "优化这段代码的性能",              # Chinese, short
+            "このコードを直して",              # Japanese
+            "이 코드를 고쳐줘",                # Korean
+        ):
+            self.assertFalse(coach.should_skip(p, 6), p)
+
+    def test_cjk_single_char_skipped(self):
+        for p in ("好", "嗯", "对"):           # 1-char acknowledgements
+            self.assertTrue(coach.should_skip(p, 6), p)
+
+    def test_has_cjk(self):
+        self.assertTrue(coach._has_cjk("修复bug"))
+        self.assertTrue(coach._has_cjk("テスト"))
+        self.assertFalse(coach._has_cjk("fix the bug"))
+
+    def test_auto_mode_resolves_by_script_for_cjk_native(self):
+        cfg = {"lang_mode": "auto", "native": "Chinese"}
+        # CJK input -> translate; non-CJK (target) input -> correct.
+        self.assertEqual(coach._resolve_lang_mode(cfg, "帮我修复bug"), "translate")
+        self.assertEqual(coach._resolve_lang_mode(cfg, "fix the bug"), "correct")
+        # Non-CJK native keeps model-driven auto.
+        self.assertEqual(
+            coach._resolve_lang_mode({"lang_mode": "auto", "native": "Spanish"}, "hola"),
+            "auto",
+        )
+        # Non-auto modes pass through unchanged.
+        self.assertEqual(
+            coach._resolve_lang_mode({"lang_mode": "translate", "native": "Chinese"}, "x"),
+            "translate",
+        )
+
 
 class TestLangModeAndState(unittest.TestCase):
     def _env(self, tmpdir, **extra):
@@ -183,6 +218,31 @@ class TestLangModeAndState(unittest.TestCase):
             coach._control(["--ctl", "enable", "translate"], proj_a)
             self.assertTrue(coach.load_config(proj_a)["translate_on"])
             self.assertFalse(coach.load_config(proj_b)["translate_on"])
+
+    def test_project_filename_is_readable(self):
+        env = self._env("/tmp/x", COACH_STATE_SCOPE="project",
+                        CLAUDE_PROJECT_DIR="/work/MyApp")
+        self.assertIn("state.MyApp.", os.path.basename(coach.state_path(env)))
+
+    def test_same_basename_different_path_no_collision(self):
+        # /a/proj and /b/proj share a basename but must NOT share a file.
+        a = coach.state_path(
+            self._env("/tmp/x", COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/a/proj")
+        )
+        b = coach.state_path(
+            self._env("/tmp/x", COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/b/proj")
+        )
+        self.assertNotEqual(a, b)
+
+    def test_project_path_is_recorded_in_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/work/MyApp")
+            coach._control(["--ctl", "enable", "translate"], env)
+            self.assertEqual(coach.load_state(env).get("project"), "/work/MyApp")
+            # global scope does not record a project path
+            genv = self._env(d)
+            coach._control(["--ctl", "enable", "translate"], genv)
+            self.assertNotIn("project", coach.load_state(genv))
 
     def test_control_switch_state_wins_over_env(self):
         with tempfile.TemporaryDirectory() as d:

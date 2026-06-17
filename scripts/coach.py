@@ -67,15 +67,16 @@ Configuration (environment variables):
                            `/prompt-coach:*` toggle applies: global = one shared switch;
                            project = isolated per CLAUDE_PROJECT_DIR. (Per-session
                            is not possible — see state_path().)
-  COACH_STATE_DIR          dir for the runtime state file (default: ~/.claude). Must
-                           NOT depend on CLAUDE_PLUGIN_DATA — that differs between the
-                           hook and the /prompt-coach command, which would desync them.
+  COACH_STATE_DIR          dir for the runtime state file (default:
+                           ~/.claude/prompt-coach). Must NOT depend on
+                           CLAUDE_PLUGIN_DATA — that differs between the hook and
+                           the /prompt-coach command, which would desync them.
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
 
 Runtime toggle: the `/prompt-coach:power|enable|disable|status|help` commands write a
-small state file (under CLAUDE_PLUGIN_DATA / PLUGIN_DATA, else ~/.claude) that this
-hook reads on every prompt. They override COACH_DISABLE / COACH_EVALUATE /
+small state file (~/.claude/prompt-coach/, fixed home path — see state_path)
+that this hook reads on every prompt. They override COACH_DISABLE / COACH_EVALUATE /
 COACH_CORRECT / COACH_TRANSLATE so you can flip behavior mid-session with no restart.
 
 Re-entrancy: the CLI backend's nested `codex exec` / `claude -p` call could
@@ -463,31 +464,45 @@ def state_path(env):
 
     Scope (env COACH_STATE_SCOPE):
       - "global" (default): one shared file — a toggle affects every session.
-      - "project": keyed by CLAUDE_PROJECT_DIR / PROJECT_DIR (a stable per-project
-        filename suffix), so different projects are independent. Both the hook and
-        the `/prompt-coach:*` command see that env var, so they compute the same path.
+      - "project": keyed by the project dir — file named
+        state.<dir-basename>.<short-hash>.json (readable name + hash so same-named
+        projects in different paths don't collide), and the full path is recorded
+        inside the file. Both the hook and the command resolve the same path.
 
     True per-session scope is not offered: the platform exposes session_id only in
     the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
     subprocess) has no reliable way to learn which session it is in.
 
-    Location: a FIXED home path (`~/.claude/`, overridable with COACH_STATE_DIR).
-    It must NOT depend on CLAUDE_PLUGIN_DATA / PLUGIN_DATA: those are set for the
-    hook but NOT for the `/prompt-coach:*` command subprocess, so keying off them
-    makes the command and the hook read different files — the command's toggles
-    would silently never reach the hook. HOME is present in both contexts.
+    Location: a FIXED home dir (`~/.claude/prompt-coach/`, overridable with
+    COACH_STATE_DIR) — a dedicated folder so project-scoped files don't litter
+    ~/.claude. It must NOT depend on CLAUDE_PLUGIN_DATA / PLUGIN_DATA: those are
+    set for the hook but NOT for the `/prompt-coach:*` command subprocess, so
+    keying off them makes the command and the hook read different files — the
+    command's toggles would silently never reach the hook. HOME is in both.
     """
     base = env.get("COACH_STATE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude"
+        os.path.expanduser("~"), ".claude", "prompt-coach"
     )
-    name = "prompt-coach-state.json"
+    name = "state.json"
     scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
     if scope == "project":
-        proj = env.get("CLAUDE_PROJECT_DIR") or env.get("PROJECT_DIR") or env.get("PWD")
+        proj = _project_dir(env)
         if proj:
-            digest = hashlib.sha1(proj.encode("utf-8")).hexdigest()[:12]
-            name = "prompt-coach-state.%s.json" % digest
+            # Readable basename + short hash of the FULL path: the name shows which
+            # project at a glance, while the hash keeps same-named projects in
+            # different paths from colliding (and avoids over-long path-based names).
+            slug = "".join(
+                c if (c.isalnum() or c in "._-") else "-"
+                for c in os.path.basename(proj.rstrip("/\\"))
+            )[:40].strip("-") or "x"
+            digest = hashlib.sha1(proj.encode("utf-8")).hexdigest()[:8]
+            name = "state.%s.%s.json" % (slug, digest)
     return os.path.join(base, name)
+
+
+def _project_dir(env):
+    """The project root used for project-scoped state (hook and command agree)."""
+    return env.get("CLAUDE_PROJECT_DIR") or env.get("PROJECT_DIR") or env.get("PWD")
 
 
 def load_state(env):
@@ -643,6 +658,26 @@ _CMD_PREFIXES = (
 )
 
 
+def _has_cjk(s):
+    """True if the text contains Chinese / Japanese / Korean characters.
+
+    These scripts are written without spaces between words, so whitespace word-
+    counting (used by the single-token rule) would treat a whole sentence as one
+    "word" and wrongly skip it.
+    """
+    for c in s:
+        o = ord(c)
+        if (
+            0x4E00 <= o <= 0x9FFF      # CJK Unified Ideographs
+            or 0x3400 <= o <= 0x4DBF   # CJK Extension A
+            or 0x3040 <= o <= 0x30FF   # Hiragana + Katakana
+            or 0xAC00 <= o <= 0xD7A3   # Hangul syllables
+            or 0xFF66 <= o <= 0xFF9D   # half-width Katakana
+        ):
+            return True
+    return False
+
+
 def should_skip(prompt, min_chars):
     """Cheap, deterministic pre-filter run before any model call.
 
@@ -652,6 +687,10 @@ def should_skip(prompt, min_chars):
     prompts — even short, vague ones like "fix bug" or "review code" — pass
     through; the model (which reads recent conversation) decides whether they
     actually need coaching and stays silent on context-clear follow-ups.
+
+    CJK (Chinese/Japanese/Korean) text has no word spaces, so it is judged by
+    character count instead of word count — otherwise a whole sentence would look
+    like one token and be skipped (which broke translate mode for those users).
     """
     if prompt is None:
         return True
@@ -670,6 +709,8 @@ def should_skip(prompt, min_chars):
         return True
     if norm.startswith(_CMD_PREFIXES):
         return True
+    if _has_cjk(norm):       # space-less script: judge by length, not word count
+        return len(norm) < 2
     words = norm.split()
     if len(words) <= 1:      # single token: command, answer, or pronoun fragment
         return True
@@ -769,8 +810,25 @@ def build_delivery(analysis, cfg):
 # Model call (isolated so pure helpers stay testable without the SDK / network)
 # ---------------------------------------------------------------------------
 
-def _system(cfg):
-    lang_axis = _LANG_AXIS.get(cfg.get("lang_mode", "correct"), _LANG_CORRECT)
+_CJK_NATIVES = ("chinese", "japanese", "korean", "中文", "日本語", "한국어")
+
+
+def _resolve_lang_mode(cfg, prompt=""):
+    """Pick the language behavior for THIS prompt.
+
+    For "auto" with a CJK native language, decide deterministically by script
+    instead of trusting a small model to detect the input language: CJK input ->
+    translate, otherwise -> correct. (Non-CJK natives keep the model-driven auto
+    template.)
+    """
+    mode = cfg.get("lang_mode", "correct")
+    if mode == "auto" and cfg.get("native", "").strip().lower() in _CJK_NATIVES:
+        return "translate" if _has_cjk(prompt) else "correct"
+    return mode
+
+
+def _system(cfg, prompt=""):
+    lang_axis = _LANG_AXIS.get(_resolve_lang_mode(cfg, prompt), _LANG_CORRECT)
     base = (_SYS_HEADER + lang_axis + _PROMPT_AXIS).format(
         native=cfg["native"], target=cfg["target"], level=cfg["level"]
     )
@@ -846,7 +904,7 @@ def _analyze_cli(prompt, cfg, context=""):
         child_env["COACH_NESTED"] = "1"
         proc = subprocess.run(
             cmd,
-            input=_system(cfg) + "\n\n" + _user_content(prompt, context),
+            input=_system(cfg, prompt) + "\n\n" + _user_content(prompt, context),
             capture_output=True,
             text=True,
             timeout=cfg["timeout"],
@@ -876,7 +934,7 @@ def _analyze_api(prompt, cfg, context=""):
     client = OpenAI(timeout=cfg["timeout"])
     resp = client.responses.create(
         model=cfg["api_model"],
-        instructions=_system(cfg),
+        instructions=_system(cfg, prompt),
         input=_user_content(prompt, context),
         text={
             "format": {
@@ -899,7 +957,7 @@ def _analyze_claude_cli(prompt, cfg, context=""):
         "--strict-mcp-config",
         "--output-format", "json",
         "--model", cfg["anthropic_model"],
-        "--append-system-prompt", _system(cfg),
+        "--append-system-prompt", _system(cfg, prompt),
     ]
     child_env = dict(os.environ)
     child_env["COACH_NESTED"] = "1"
@@ -933,7 +991,7 @@ def _analyze_anthropic_api(prompt, cfg, context=""):
     resp = client.with_options(timeout=cfg["timeout"]).messages.create(
         model=cfg["anthropic_model"],
         max_tokens=1024,
-        system=_system(cfg),
+        system=_system(cfg, prompt),
         messages=[{"role": "user", "content": _user_content(prompt, context)}],
         tools=[{
             "name": "prompt_coach_analysis",
@@ -1120,6 +1178,12 @@ def _control(argv, env):
         return 2
 
     if action != "status":
+        # Self-document which project a project-scoped file belongs to (the name
+        # is hashed; this makes `cat state.<x>.json` tell you the path).
+        if (env.get("COACH_STATE_SCOPE") or "").strip().lower() == "project":
+            proj = _project_dir(env)
+            if proj:
+                state["project"] = proj
         path = state_path(env)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
