@@ -67,6 +67,9 @@ Configuration (environment variables):
                            `/prompt-coach:*` toggle applies: global = one shared switch;
                            project = isolated per CLAUDE_PROJECT_DIR. (Per-session
                            is not possible — see state_path().)
+  COACH_STATE_DIR          dir for the runtime state file (default: ~/.claude). Must
+                           NOT depend on CLAUDE_PLUGIN_DATA — that differs between the
+                           hook and the /prompt-coach command, which would desync them.
   COACH_DISABLE            set truthy to disable without uninstalling
   COACH_DEBUG              set truthy to print errors to stderr
 
@@ -468,13 +471,14 @@ def state_path(env):
     the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
     subprocess) has no reliable way to learn which session it is in.
 
-    The file always lives in the plugin data dir (CLAUDE_PLUGIN_DATA / PLUGIN_DATA,
-    else ~/.claude) — never inside the user's project, so it can't be committed.
+    Location: a FIXED home path (`~/.claude/`, overridable with COACH_STATE_DIR).
+    It must NOT depend on CLAUDE_PLUGIN_DATA / PLUGIN_DATA: those are set for the
+    hook but NOT for the `/prompt-coach:*` command subprocess, so keying off them
+    makes the command and the hook read different files — the command's toggles
+    would silently never reach the hook. HOME is present in both contexts.
     """
-    base = (
-        env.get("CLAUDE_PLUGIN_DATA")
-        or env.get("PLUGIN_DATA")
-        or os.path.join(os.path.expanduser("~"), ".claude")
+    base = env.get("COACH_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude"
     )
     name = "prompt-coach-state.json"
     scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()

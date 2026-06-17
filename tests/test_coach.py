@@ -8,6 +8,7 @@ or  python3 tests/test_coach.py
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,31 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import coach  # type: ignore[import-not-found]  # noqa: E402  (resolved at runtime via sys.path)
+
+
+# Point "~" at an empty temp home for the whole module so the default state path
+# (~/.claude/prompt-coach-state.json) never reads the real user's file. Tests that
+# set COACH_STATE_DIR explicitly still override this.
+_FAKE_HOME = ""
+_HOME_PATCHER = None
+
+
+def _fake_expanduser(p):
+    return p.replace("~", _FAKE_HOME, 1) if p == "~" or p.startswith("~/") else p
+
+
+def setUpModule():
+    global _FAKE_HOME, _HOME_PATCHER
+    _FAKE_HOME = tempfile.mkdtemp(prefix="prompt-coach-test-home-")
+    _HOME_PATCHER = mock.patch("os.path.expanduser", side_effect=_fake_expanduser)
+    _HOME_PATCHER.start()
+
+
+def tearDownModule():
+    if _HOME_PATCHER is not None:
+        _HOME_PATCHER.stop()
+    if _FAKE_HOME:
+        shutil.rmtree(_FAKE_HOME, ignore_errors=True)
 
 
 def make_analysis(lang_issues=True, prompt_issues=True):
@@ -94,7 +120,7 @@ class TestShouldSkip(unittest.TestCase):
 
 class TestLangModeAndState(unittest.TestCase):
     def _env(self, tmpdir, **extra):
-        env = {"PATH": "", "CLAUDE_PLUGIN_DATA": tmpdir}
+        env = {"PATH": "", "COACH_STATE_DIR": tmpdir}
         env.update(extra)
         return env
 

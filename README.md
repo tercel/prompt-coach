@@ -232,10 +232,13 @@ Re-run the script after moving the repo. (The same Codex format — YAML frontma
 + `$ARGUMENTS` — is why these work; `agent-skill-bundler` only converts *skills*,
 not hook commands, so it isn't involved here.)
 
-Each toggle is written to a small state file (under `CLAUDE_PLUGIN_DATA` / `PLUGIN_DATA`,
-else `~/.claude/` — never inside your project) that the hook reads every prompt; it
-overrides the `COACH_EVALUATE` / `COACH_CORRECT` / `COACH_TRANSLATE` / `COACH_DISABLE`
-env defaults.
+Each toggle is written to a small state file at `~/.claude/prompt-coach-state.json`
+(override the dir with `COACH_STATE_DIR`; never inside your project) that the hook
+reads every prompt; it overrides the `COACH_EVALUATE` / `COACH_CORRECT` /
+`COACH_TRANSLATE` / `COACH_DISABLE` env defaults. The path is intentionally a fixed
+home location, **not** `CLAUDE_PLUGIN_DATA` — that variable is set for the hook but
+not for the `/prompt-coach:*` command subprocess, so keying off it would make the
+command and the hook read different files (your toggles would silently never apply).
 
 ### Toggle scope (`COACH_STATE_SCOPE`)
 
