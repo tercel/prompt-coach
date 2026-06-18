@@ -1,5 +1,7 @@
 # prompt-coach
 
+**English** | [中文](README.zh.md)
+
 A `UserPromptSubmit` plugin for **Claude Code and Codex** that coaches every
 prompt, two ways:
 
