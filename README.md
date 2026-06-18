@@ -137,7 +137,7 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_EVALUATE` | `off` | Prompt-quality coaching on/off. Overridden live by `/prompt-coach:enable|disable evaluate`. |
 | `COACH_CORRECT` | `off` | Target-language correction on/off. Overridden live by `/prompt-coach:enable|disable correct`. |
 | `COACH_TRANSLATE` | `off` | Native→target translation on/off. Overridden live by `/prompt-coach:enable|disable translate`. |
-| `COACH_STATE_SCOPE` | `global` | `global` or `project` — how widely a `/prompt-coach:*` toggle applies. |
+| `COACH_STATE_SCOPE` | `project` | `project` or `global` — how widely a `/prompt-coach:*` toggle applies. |
 | `COACH_STATE_DIR` | `~/.config/prompt-coach` | Directory for the runtime state file. |
 | `COACH_CLI_FLAGS` | unset | Extra space-separated flags for `codex exec` (Codex CLI backend). |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
@@ -260,8 +260,8 @@ How widely a `/prompt-coach:*` toggle reaches:
 
 | Scope | Behavior |
 |---|---|
-| `global` *(default)* | One shared switch — a toggle affects every session and project. |
-| `project` | Isolated per `CLAUDE_PROJECT_DIR` — "translate in project A" leaves project B untouched. |
+| `project` *(default)* | Isolated per `CLAUDE_PROJECT_DIR` — "translate in project A" leaves project B untouched. Falls back to the shared file when no project dir can be resolved. |
+| `global` | One shared switch — a toggle affects every session and project. |
 
 **Per-session scope is not offered.** The platform exposes `session_id` only in the
 hook's stdin payload, not as an env var, so the `/prompt-coach:*` commands (a plain subprocess)

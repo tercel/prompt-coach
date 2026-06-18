@@ -65,9 +65,9 @@ Configuration (environment variables):
                            (default: 6; set 0 to analyze the prompt in isolation)
   COACH_CONTEXT_CHARS      max characters of rendered context (default: 2000)
   COACH_TIMEOUT            backend timeout seconds (default: 25)
-  COACH_STATE_SCOPE        "global" (default) | "project". Controls how widely a
-                           `/prompt-coach:*` toggle applies: global = one shared switch;
-                           project = isolated per CLAUDE_PROJECT_DIR. (Per-session
+  COACH_STATE_SCOPE        "project" (default) | "global". Controls how widely a
+                           `/prompt-coach:*` toggle applies: project = isolated per
+                           CLAUDE_PROJECT_DIR; global = one shared switch. (Per-session
                            is not possible — see state_path().)
   COACH_STATE_DIR          dir for the runtime state file (default:
                            ~/.config/prompt-coach). Must NOT depend on
@@ -465,11 +465,12 @@ def state_path(env):
     """Path to the runtime state file toggled by the `/prompt-coach:*` command.
 
     Scope (env COACH_STATE_SCOPE):
-      - "global" (default): one shared file — a toggle affects every session.
-      - "project": keyed by the project dir — file named
+      - "project" (default): keyed by the project dir — file named
         state.<dir-basename>.<short-hash>.json (readable name + hash so same-named
         projects in different paths don't collide), and the full path is recorded
-        inside the file. Both the hook and the command resolve the same path.
+        inside the file. Both the hook and the command resolve the same path. Falls
+        back to the shared state.json when no project dir can be resolved.
+      - "global": one shared file — a toggle affects every session.
 
     True per-session scope is not offered: the platform exposes session_id only in
     the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
@@ -488,7 +489,7 @@ def state_path(env):
     else:
         base = os.path.join(os.path.expanduser("~"), ".config", "prompt-coach")
     name = "state.json"
-    scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
+    scope = (env.get("COACH_STATE_SCOPE") or "project").strip().lower()
     if scope == "project":
         proj = _project_dir(env)
         if proj:
@@ -1223,7 +1224,7 @@ def _control(argv, env):
     if action != "status":
         # Self-document which project a project-scoped file belongs to (the name
         # is hashed; this makes `cat state.<x>.json` tell you the path).
-        if (env.get("COACH_STATE_SCOPE") or "").strip().lower() == "project":
+        if (env.get("COACH_STATE_SCOPE") or "project").strip().lower() == "project":
             proj = _project_dir(env)
             if proj:
                 state["project"] = proj
@@ -1237,7 +1238,7 @@ def _control(argv, env):
             return 1
 
     cfg = load_config(env)
-    scope = (env.get("COACH_STATE_SCOPE") or "global").strip().lower()
+    scope = (env.get("COACH_STATE_SCOPE") or "project").strip().lower()
     print(
         "prompt-coach: power %s | evaluate: %s | correct: %s | translate: %s"
         % (

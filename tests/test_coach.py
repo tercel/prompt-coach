@@ -209,9 +209,25 @@ class TestLangModeAndState(unittest.TestCase):
 
     def test_state_scope_global_is_shared(self):
         with tempfile.TemporaryDirectory() as d:
+            a = coach.state_path(
+                self._env(d, COACH_STATE_SCOPE="global", CLAUDE_PROJECT_DIR="/proj/a")
+            )
+            b = coach.state_path(
+                self._env(d, COACH_STATE_SCOPE="global", CLAUDE_PROJECT_DIR="/proj/b")
+            )
+            self.assertEqual(a, b)  # global: project dir ignored
+
+    def test_state_scope_defaults_to_project(self):
+        # Unset scope now isolates per project (project is the default).
+        with tempfile.TemporaryDirectory() as d:
             a = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/a"))
             b = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/b"))
-            self.assertEqual(a, b)  # global: project dir ignored
+            self.assertNotEqual(a, b)
+            # No resolvable project dir -> falls back to the shared file.
+            self.assertEqual(
+                os.path.basename(coach.state_path({"COACH_STATE_DIR": d})),
+                "state.json",
+            )
 
     def test_state_scope_project_isolates(self):
         with tempfile.TemporaryDirectory() as d:
@@ -256,8 +272,8 @@ class TestLangModeAndState(unittest.TestCase):
             env = self._env(d, COACH_STATE_SCOPE="project", CLAUDE_PROJECT_DIR="/work/MyApp")
             coach._control(["--ctl", "enable", "translate"], env)
             self.assertEqual(coach.load_state(env).get("project"), "/work/MyApp")
-            # global scope does not record a project path
-            genv = self._env(d)
+            # global scope does not record a project path, even with a project dir
+            genv = self._env(d, COACH_STATE_SCOPE="global", CLAUDE_PROJECT_DIR="/work/Other")
             coach._control(["--ctl", "enable", "translate"], genv)
             self.assertNotIn("project", coach.load_state(genv))
 
