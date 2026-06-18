@@ -1,0 +1,8 @@
+{
+  "backend": "ollama",
+  "ollama_model": "qwen2.5-coder:32b-instruct-q4_K_M",
+  "ollama_host": "http://localhost:11434",
+  "ollama_keep_alive": "30m",
+  "native": "Chinese",
+  "target": "English"
+}

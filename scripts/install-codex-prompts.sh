@@ -13,6 +13,7 @@
 #   $prompt-coach-power on|off
 #   $prompt-coach-enable  <evaluate|correct|translate ...>
 #   $prompt-coach-disable <evaluate|correct|translate ...>
+#   $prompt-coach-backend <auto|cli|api|ollama> [model]
 #   $prompt-coach-status
 #   $prompt-coach-help
 #
@@ -82,6 +83,7 @@ emit power    "[on|off]"                        "prompt-coach: turn the whole ho
 emit enable   "[evaluate|correct|translate ...]" "prompt-coach: enable feature(s) (abbrev e|c|t ok)"          enable   1
 emit disable  "[evaluate|correct|translate ...]" "prompt-coach: disable feature(s) (abbrev e|c|t ok)"         disable  1
 emit lang     "native <X> target <Y>"            "prompt-coach: set native/target language"                       lang     1
+emit backend  "[auto|cli|api|ollama] [model]"    "prompt-coach: choose analysis backend (auto=CLI, default)"      backend  1
 emit status   ""                                 "prompt-coach: show current state"                               status   0
 emit help     "[en|zh]"                          "prompt-coach: show command usage (en|zh, default en)"           help     1
 

@@ -21,15 +21,22 @@ Delivery modes (env COACH_MODE):
   - "block": blocking. Surfaces the coaching and blocks the prompt so you
     consciously resubmit the improved version (a stricter learning loop).
 
-Backends (env COACH_BACKEND):
-  - "auto" (default): use the current hook platform's CLI, then its API.
+Backends (env COACH_BACKEND, or persistent `/prompt-coach:backend <choice>`):
+  - "auto" (default): use the current hook platform's CLI, then its API. The CLI
+    spawns a nested agent — robust but slow (often 15-25s+); prefer a direct
+    backend below if it straddles COACH_TIMEOUT and silently drops coaching.
   - "cli" / "api": force the current hook platform's CLI / API.
   - "codex" / "openai": force Codex CLI / OpenAI API.
   - "claude" / "anthropic": force Claude CLI / Anthropic API.
+  - "ollama": force a local Ollama server (COACH_OLLAMA_HOST / COACH_OLLAMA_MODEL).
+    The model must be one you've pulled, or the call fails and the hook stays
+    silent. Set it via `/prompt-coach:backend ollama <model>` — the choice persists
+    in the cross-platform global config file (config.json), shared by Claude+Codex.
 
 Configuration (environment variables):
-  COACH_BACKEND            "auto" (default) | "cli" | "api"
+  COACH_BACKEND            "auto" (default) | "cli" | "api" | "ollama"
                            | "codex" | "openai" | "claude" | "anthropic"
+                           (also settable persistently via `/prompt-coach:backend`)
   COACH_PLATFORM           "auto" (default) | "codex" | "claude"
   COACH_CODEX_BIN          path to the `codex` binary (default: found on PATH)
   COACH_CLAUDE_BIN         path to the `claude` binary (default: found on PATH)
@@ -48,6 +55,12 @@ Configuration (environment variables):
   COACH_CLI_MODEL          override only the Codex CLI model
   COACH_API_MODEL          override only the OpenAI API model
   COACH_ANTHROPIC_MODEL    override only the Anthropic API / Claude CLI model
+  COACH_OLLAMA_HOST        Ollama server base URL (default: http://localhost:11434)
+  COACH_OLLAMA_MODEL       Ollama model for the "ollama" backend (default: llama3.1;
+                           for quality try a strong instruct model, e.g.
+                           qwen2.5-coder:32b-instruct-q4_K_M)
+  COACH_OLLAMA_KEEP_ALIVE  how long Ollama keeps the model resident between calls
+                           (default: 30m) — avoids repeated cold model-loads
   Coaching features — each independent on/off, overridden live by `/prompt-coach:*`.
   ALL default OFF (opt-in): a freshly-installed plugin does nothing until you turn
   a feature on (and when all are off the hook exits before any model call).
@@ -64,7 +77,19 @@ Configuration (environment variables):
   COACH_CONTEXT_MESSAGES   recent turns of conversation context to include
                            (default: 6; set 0 to analyze the prompt in isolation)
   COACH_CONTEXT_CHARS      max characters of rendered context (default: 2000)
-  COACH_TIMEOUT            backend timeout seconds (default: 25)
+  COACH_CONTEXT_PER_MSG_CHARS  max chars kept per context message (default: 600).
+                           Fenced code blocks are replaced with a [code] marker and
+                           truncation snaps to a word boundary, so the budget holds
+                           meaning, not half-cut code.
+  COACH_MAX_PROMPT_CHARS   cap the analyzed prompt; longer prompts are sent as a
+                           head+tail excerpt (default: 4000). Stops a pasted log
+                           from blowing past COACH_TIMEOUT.
+  COACH_SKIP_LANG_ON_PASTE on/off (default on) — when the prompt is mostly a log /
+                           stack trace / code dump, skip the language axis (don't
+                           "correct the grammar" of machine output).
+  COACH_TIMEOUT            backend timeout seconds (default: 60). The nested CLI
+                           backend can take 15-25s+; too low a value silently
+                           drops coaching when the call overruns it.
   COACH_STATE_SCOPE        "project" (default) | "global". Controls how widely a
                            `/prompt-coach:*` toggle applies: project = isolated per
                            CLAUDE_PROJECT_DIR; global = one shared switch. (Per-session
@@ -92,6 +117,7 @@ backend, network failure, bad JSON) results in a clean exit 0 with no output.
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -337,7 +363,34 @@ def extract_messages_from_lines(lines):
     return out
 
 
-def build_context(messages, current_prompt, max_messages, max_chars, per_msg_chars=600):
+# Fenced code block (```...```), non-greedy, across lines.
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _strip_code_blocks(text):
+    """Replace fenced code blocks with a short placeholder.
+
+    Keeps the *semantics* ("there was code here") while freeing the truncation
+    budget for prose — so a long assistant code reply doesn't crowd out the
+    conversational signal the coach actually needs.
+    """
+    return _FENCE_RE.sub(" [code] ", text or "")
+
+
+def _truncate_words(text, limit):
+    """Trim to <=limit chars, preferring a word boundary so we don't cut a word
+    in half (which can garble meaning). Appends an ellipsis when trimmed."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    sp = cut.rfind(" ")
+    if sp >= limit * 0.6:        # only snap back to a space if it's not too far
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
+def build_context(messages, current_prompt, max_messages, max_chars,
+                  per_msg_chars=600, strip_code=True):
     """Render the last few turns into a compact transcript string."""
     msgs = [(r, t) for (r, t) in messages if t and t.strip()]
     # Drop a trailing user turn that just echoes the prompt we're analyzing.
@@ -353,9 +406,10 @@ def build_context(messages, current_prompt, max_messages, max_chars, per_msg_cha
     rendered = []
     for role, text in msgs:
         label = "User" if role == "user" else "Assistant"
+        if strip_code:
+            text = _strip_code_blocks(text)
         t = " ".join(text.split())  # collapse whitespace/newlines
-        if len(t) > per_msg_chars:
-            t = t[:per_msg_chars] + "…"
+        t = _truncate_words(t, per_msg_chars)
         rendered.append("%s: %s" % (label, t))
     out = "\n".join(rendered)
     if max_chars > 0 and len(out) > max_chars:
@@ -377,7 +431,8 @@ def _read_tail_lines(path, max_bytes=65536):
     return data.decode("utf-8", "replace").splitlines()
 
 
-def read_recent_context(transcript_path, current_prompt, max_messages, max_chars):
+def read_recent_context(transcript_path, current_prompt, max_messages, max_chars,
+                        per_msg_chars=600):
     """Read the tail of the session transcript and render recent turns."""
     if not transcript_path or max_messages <= 0:
         return ""
@@ -386,7 +441,9 @@ def read_recent_context(transcript_path, current_prompt, max_messages, max_chars
     except OSError:
         return ""
     messages = extract_messages_from_lines(lines)
-    return build_context(messages, current_prompt, max_messages, max_chars)
+    return build_context(
+        messages, current_prompt, max_messages, max_chars, per_msg_chars
+    )
 
 
 # ISO 639-1 code -> English language name, for naming the user's native language
@@ -468,9 +525,10 @@ def state_path(env):
       - "project" (default): keyed by the project dir — file named
         state.<dir-basename>.<short-hash>.json (readable name + hash so same-named
         projects in different paths don't collide), and the full path is recorded
-        inside the file. Both the hook and the command resolve the same path. Falls
-        back to the shared state.json when no project dir can be resolved.
-      - "global": one shared file — a toggle affects every session.
+        inside the file. Both the hook and the command resolve the same path.
+      - "global" (or project scope with no resolvable project dir): there is NO
+        separate state file — feature toggles live in the single global config.json
+        (config_path) alongside backend/language. One global file, not two.
 
     True per-session scope is not offered: the platform exposes session_id only in
     the hook's stdin payload, not as an env var, so the `/prompt-coach:*` command (a plain
@@ -484,11 +542,6 @@ def state_path(env):
     and the hook read different files — the command's toggles would silently
     never reach the hook. HOME is in both.
     """
-    if env.get("COACH_STATE_DIR"):
-        base = env["COACH_STATE_DIR"]
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".config", "prompt-coach")
-    name = "state.json"
     scope = (env.get("COACH_STATE_SCOPE") or "project").strip().lower()
     if scope == "project":
         proj = _project_dir(env)
@@ -501,13 +554,35 @@ def state_path(env):
                 for c in os.path.basename(proj.rstrip("/\\"))
             )[:40].strip("-") or "x"
             digest = hashlib.sha1(proj.encode("utf-8")).hexdigest()[:8]
-            name = "state.%s.%s.json" % (slug, digest)
-    return os.path.join(base, name)
+            return os.path.join(_state_base_dir(env), "state.%s.%s.json" % (slug, digest))
+    # Global scope, or project scope with no resolvable dir: the global config file
+    # IS the feature store — no separate state.json.
+    return config_path(env)
 
 
 def _project_dir(env):
     """The project root used for project-scoped state (hook and command agree)."""
     return env.get("CLAUDE_PROJECT_DIR") or env.get("PROJECT_DIR") or env.get("PWD")
+
+
+def _state_base_dir(env):
+    """The prompt-coach home dir (COACH_STATE_DIR override, else ~/.config/prompt-coach)."""
+    if env.get("COACH_STATE_DIR"):
+        return env["COACH_STATE_DIR"]
+    return os.path.join(os.path.expanduser("~"), ".config", "prompt-coach")
+
+
+def config_path(env):
+    """Path to the cross-platform GLOBAL config file (machine-wide settings:
+    backend, ollama_*, native/target).
+
+    Lives in the prompt-coach home dir, NOT in a host's settings, because
+    ~/.claude/settings.json is Claude-only and ~/.codex/config.toml is Codex-only
+    — neither is shared. Both platforms run this same coach.py under the same HOME,
+    so a file here is the one place both hooks can read. Unlike state_path(), this
+    is NEVER scoped: it is the single global config for every project/session.
+    """
+    return os.path.join(_state_base_dir(env), "config.json")
 
 
 def load_state(env):
@@ -518,6 +593,30 @@ def load_state(env):
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def load_global_config(env):
+    """Read the cross-platform global config file. Returns {} on any error."""
+    try:
+        with open(config_path(env), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_global_config(env, updates):
+    """Merge `updates` into the global config file. Returns an error string or None."""
+    conf = load_global_config(env)
+    conf.update(updates)
+    path = config_path(env)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(conf, fh)
+    except OSError as exc:
+        return "could not write config file: %r" % (exc,)
+    return None
 
 
 def load_config(env):
@@ -533,13 +632,22 @@ def load_config(env):
         "claude", path=env.get("PATH")
     )
     shared_model = (env.get("COACH_MODEL") or "").strip()
-    # The state file (written by `/prompt-coach:*`) overrides env defaults for the
-    # things the in-session commands control: power, the feature switches, and the
-    # native/target languages.
+    # Two config layers, plus env:
+    #   - state: per-project (default scope) on/off feature toggles + power
+    #   - gconf: the cross-platform GLOBAL config file (backend, ollama_*, language)
+    # Resolution for shared settings: state > gconf > env > built-in default.
+    # Feature toggles stay state-only (state > env) so they remain project-scoped.
     state = load_state(env)
-    # native/target: state (set via `/prompt-coach:lang`) > env > (native: locale).
-    target = (state.get("target") or env.get("COACH_TARGET_LANG") or "English").strip()
-    native_explicit = state.get("native") or env.get("COACH_NATIVE_LANG")
+    gconf = load_global_config(env)
+    # native/target: state (per-project) > gconf (global, via `/prompt-coach:lang`)
+    # > env > (native: locale).
+    target = (
+        state.get("target") or gconf.get("target")
+        or env.get("COACH_TARGET_LANG") or "English"
+    ).strip()
+    native_explicit = (
+        state.get("native") or gconf.get("native") or env.get("COACH_NATIVE_LANG")
+    )
     native = (native_explicit or detect_native_language(env)).strip()
     # Disable the language axis ONLY when the user EXPLICITLY declares their native
     # language to equal the target (a native practicing their own tongue — nothing
@@ -571,8 +679,16 @@ def load_config(env):
         lang_mode = "translate"
     else:
         lang_mode = "correct"
+    # Backend: per-project state override > global config file (set via
+    # `/prompt-coach:backend`) > env COACH_BACKEND > "auto" (CLI-preferring). "auto"
+    # spawns the platform CLI; "api"/"ollama" hit a network endpoint directly
+    # (faster, more reliable — no nested-agent spin-up).
+    backend = (
+        state.get("backend") or gconf.get("backend")
+        or env.get("COACH_BACKEND") or "auto"
+    ).strip().lower()
     return {
-        "backend": (env.get("COACH_BACKEND", "auto") or "auto").strip().lower(),
+        "backend": backend,
         "platform": detect_platform(env),
         "codex_bin": codex_bin,
         "claude_bin": claude_bin,
@@ -589,12 +705,26 @@ def load_config(env):
         "anthropic_model": (
             env.get("COACH_ANTHROPIC_MODEL") or shared_model or "claude-haiku-4-5-20251001"
         ).strip(),
+        "ollama_host": (
+            gconf.get("ollama_host") or env.get("COACH_OLLAMA_HOST")
+            or "http://localhost:11434"
+        ).strip().rstrip("/"),
+        "ollama_model": (
+            state.get("ollama_model") or gconf.get("ollama_model")
+            or env.get("COACH_OLLAMA_MODEL") or shared_model or "llama3.1"
+        ).strip(),
+        "ollama_keep_alive": (
+            gconf.get("ollama_keep_alive") or env.get("COACH_OLLAMA_KEEP_ALIVE") or "30m"
+        ).strip(),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
         "lang_mode": lang_mode,
         "min_chars": min_chars,
         "context_messages": _to_int(env.get("COACH_CONTEXT_MESSAGES"), 6),
         "context_chars": _to_int(env.get("COACH_CONTEXT_CHARS"), 2000),
-        "timeout": _to_float(env.get("COACH_TIMEOUT"), 25.0),
+        "context_per_msg_chars": _to_int(env.get("COACH_CONTEXT_PER_MSG_CHARS"), 600),
+        "max_prompt_chars": _to_int(env.get("COACH_MAX_PROMPT_CHARS"), 4000),
+        "skip_lang_on_paste": _flag(env.get("COACH_SKIP_LANG_ON_PASTE", "on")),
+        "timeout": _to_float(env.get("COACH_TIMEOUT"), 60.0),
         "disabled": disabled,
         "debug": _flag(env.get("COACH_DEBUG", "")),
         "has_api_key": bool(env.get("OPENAI_API_KEY")),
@@ -620,9 +750,37 @@ def backend_available(cfg):
         return bool(cfg["claude_bin"])
     if backend == "anthropic":
         return bool(cfg["has_anthropic_key"])
+    if backend == "ollama":
+        # A local server we can't cheaply probe here — assume reachable when
+        # explicitly selected; a down server surfaces as a swallowed call error.
+        return bool(cfg["ollama_host"] and cfg["ollama_model"])
     if platform == "claude":
         return bool(cfg["claude_bin"] or cfg["has_anthropic_key"])
     return bool(cfg["codex_bin"] or cfg["has_api_key"])
+
+
+def required_api_sdk(cfg):
+    """The pip package an API backend needs, or None for CLI/ollama backends.
+
+    The SDKs (openai / anthropic) are OPTIONAL — imported lazily, only on the
+    direct-API path. This names the dependency so `status` can flag a missing one
+    instead of the hook failing silently at call time. "auto" is not flagged: it
+    falls back to the CLI, which needs no SDK.
+    """
+    backend, platform = cfg["backend"], cfg["platform"]
+    if backend == "openai":
+        return "openai"
+    if backend == "anthropic":
+        return "anthropic"
+    if backend == "api":
+        return "anthropic" if platform == "claude" else "openai"
+    return None
+
+
+def _sdk_installed(name):
+    """True if an importable module `name` is present (no import side effects)."""
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
 
 
 def extract_json_text(text):
@@ -724,6 +882,61 @@ def should_skip(prompt, min_chars):
     if len(s) < min_chars:   # ultra-short multi-word floor ("do x", "go on")
         return True
     return False
+
+
+# Lines that look like machine output rather than prose: log timestamps/levels,
+# stack frames, tracebacks, and lines that open/close with code punctuation.
+_PASTE_LINE_RE = re.compile(
+    r"""^\s*(
+        \d{4}-\d{2}-\d{2}                       # date  2024-01-02
+      | \d{1,2}:\d{2}:\d{2}                      # time  12:34:56
+      | \[?(ERROR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL|CRITICAL)\b  # log level
+      | at\s+[\w$.]+\(                           # JS/Java frame: at foo.bar(
+      | File\s+".*",\s*line\s+\d+                # Python traceback frame
+      | Traceback\b
+      | [\w.]+(Error|Exception)\b                # FooError / mod.BarException
+      | [{}()\[\];]                              # line starting with code punctuation
+    )""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _is_paste_dominant(prompt, min_lines=8, ratio=0.5):
+    """Heuristic: is this prompt mostly a pasted log / stack trace / code dump?
+
+    Used to suppress the language axis — correcting the 'English grammar' of a
+    stack trace is noise. Cheap and deterministic (no model call). A fenced code
+    block, or a high fraction of log/stack/indented lines, marks a paste.
+    """
+    s = prompt or ""
+    if "```" in s and s.count("```") >= 2:        # explicit fenced code block
+        return True
+    lines = [ln for ln in s.splitlines() if ln.strip()]
+    if len(lines) < min_lines:
+        return False
+    paste_like = 0
+    for ln in lines:
+        indent = len(ln) - len(ln.lstrip())
+        if _PASTE_LINE_RE.search(ln) or indent >= 4:
+            paste_like += 1
+    return paste_like / len(lines) >= ratio
+
+
+def _excerpt_prompt(prompt, max_chars):
+    """Cap an over-long prompt to a head+tail excerpt before sending it to the
+    model. The instruction usually sits at the start or end of a big paste, so
+    keeping both ends preserves intent while bounding latency/cost."""
+    s = prompt or ""
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    head_n = (max_chars * 3) // 5      # ~60% head
+    tail_n = max_chars - head_n        # ~40% tail
+    omitted = len(s) - head_n - tail_n
+    return (
+        s[:head_n].rstrip()
+        + "\n\n…[%d characters trimmed]…\n\n" % omitted
+        + s[-tail_n:].lstrip()
+    )
 
 
 def parse_analysis_text(text):
@@ -1034,10 +1247,46 @@ def _analyze_anthropic_api(prompt, cfg, context=""):
     return parse_analysis_text(json.dumps(getattr(tool_block, "input")))
 
 
+def _analyze_ollama(prompt, cfg, context=""):
+    """Run analysis through a local Ollama server (native /api/chat).
+
+    Uses the stdlib only (no SDK) so the hook stays dependency-free. Structured
+    output is requested via Ollama's `format` field set to the JSON schema, so the
+    model returns a schema-conforming object directly in message.content.
+    """
+    import urllib.request
+
+    body = json.dumps({
+        "model": cfg["ollama_model"],
+        "stream": False,
+        "format": ANALYSIS_SCHEMA,
+        "options": {"temperature": 0},
+        # Keep the model resident between prompts so intermittent hook calls don't
+        # repeatedly pay the cold model-load cost (Ollama unloads after 5m by default).
+        "keep_alive": cfg["ollama_keep_alive"],
+        "messages": [
+            {"role": "system", "content": _system(cfg, prompt)},
+            {"role": "user", "content": _user_content(prompt, context)},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        cfg["ollama_host"] + "/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+        envelope = json.loads(resp.read().decode("utf-8"))
+    content = (envelope.get("message") or {}).get("content", "")
+    return parse_analysis_text(extract_json_text(content))
+
+
 def analyze(prompt, cfg, context=""):
     """Dispatch to an explicit backend or the active platform's CLI/API pair."""
     backend = cfg["backend"]
     platform = cfg["platform"]
+    if backend == "ollama":
+        return _analyze_ollama(prompt, cfg, context)
     if backend == "api":
         return (
             _analyze_anthropic_api(prompt, cfg, context)
@@ -1091,6 +1340,15 @@ _FEATURES = {
 
 _ZH_LANGS = ("zh", "zh-cn", "zh_cn", "cn", "chinese", "中文")
 
+# Backends selectable via `/prompt-coach:backend`. The headline three (auto, api,
+# ollama) cover the common cases; the platform-specific names are kept for power
+# users. "auto" (default) prefers the platform CLI; "api"/"ollama" call a network
+# endpoint directly, avoiding the slow/fragile nested-agent spin-up.
+_BACKENDS = (
+    "auto", "cli", "api", "ollama",
+    "codex", "openai", "claude", "anthropic",
+)
+
 # Accept the full feature name or its single-letter code (e|c|t). Deliberately
 # small — three features with distinct initials; no plan to add more.
 _FEATURE_ALIASES = {
@@ -1111,6 +1369,8 @@ _CTL_USAGE = (
     "  /prompt-coach:enable  <evaluate|correct|translate ...>\n"
     "  /prompt-coach:disable <evaluate|correct|translate ...>\n"
     "  /prompt-coach:lang native <X> target <Y>   (set languages; name or code, e.g. native zh target en)\n"
+    "  /prompt-coach:backend auto | cli | api | ollama [model]   (analysis engine; auto=CLI,\n"
+    "      default. For ollama, pass a pulled model: backend ollama qwen2.5-coder:32b-instruct-q4_K_M)\n"
     "  /prompt-coach:status\n"
     "  /prompt-coach:help [en|zh]\n"
     "Features — give the FULL NAME or its single LETTER (both accepted, mixable):\n"
@@ -1129,6 +1389,8 @@ _CTL_USAGE_ZH = (
     "  /prompt-coach:enable  <功能 ...>     打开一个或多个功能\n"
     "  /prompt-coach:disable <功能 ...>     关闭一个或多个功能\n"
     "  /prompt-coach:lang native <母语> target <练的语言>   设置语言(全名或代码,如 native zh target en)\n"
+    "  /prompt-coach:backend auto | cli | api | ollama [模型]   分析引擎(auto=CLI,默认;\n"
+    "      选 ollama 要带已 pull 的模型,如 backend ollama qwen2.5-coder:32b-instruct-q4_K_M)\n"
     "  /prompt-coach:status                查看当前状态\n"
     "  /prompt-coach:help [en|zh]          查看用法(语言,默认 en)\n"
     "功能 —— 用「全名」或「单字母」均可(可混用):\n"
@@ -1189,13 +1451,19 @@ def _control(argv, env):
         sys.stdout.write(_usage(env, zh=lang in _ZH_LANGS))
         return 0
 
+    # Where each action writes:
+    #   power/enable/disable -> the scoped STATE file (per-project by default)
+    #   lang/backend         -> the cross-platform GLOBAL config file (config.json)
     state = load_state(env)
+    gconf_updates = {}                              # collected global-config writes
+    write_to = None                                 # "state" | "global" | None(status)
     if action == "power":
         val = _onoff(rest[0] if rest else None)
         if val is None:
             sys.stderr.write(_usage(env))
             return 2
         state["enabled"] = val
+        write_to = "state"
     elif action in ("enable", "disable"):
         resolved = [_resolve_feature(f) for f in rest]
         if not rest or any(r is None for r in resolved):
@@ -1204,24 +1472,40 @@ def _control(argv, env):
         for feature in resolved:
             if feature is not None:   # always true after the guard above
                 state[_FEATURES[feature]] = (action == "enable")
+        write_to = "state"
     elif action == "lang":
-        # `lang native <X> target <Y>` — either or both, order-free.
-        i, updates = 0, {}
+        # `lang native <X> target <Y>` — either or both, order-free. Global: your
+        # native/target language is machine-wide, shared across projects/platforms.
+        i = 0
         while i + 1 < len(rest):
             if rest[i] in ("native", "target"):
-                updates[rest[i]] = normalize_language(rest_raw[i + 1])
+                gconf_updates[rest[i]] = normalize_language(rest_raw[i + 1])
                 i += 2
             else:
                 break
-        if not updates or i != len(rest):           # leftover/unknown tokens
+        if not gconf_updates or i != len(rest):      # leftover/unknown tokens
             sys.stderr.write(_usage(env))
             return 2
-        state.update(updates)
+        write_to = "global"
+    elif action == "backend":
+        # Read from `raw` (the un-split argv), NOT `rest`: the tokenizer turns "-"
+        # into spaces, which would shatter a model name like
+        # "qwen2.5-coder:32b-instruct-q4_K_M". raw = ["backend", choice, model?].
+        choice = raw[1].lower() if len(raw) > 1 else None
+        if choice not in _BACKENDS:
+            sys.stderr.write(_usage(env))
+            return 2
+        gconf_updates["backend"] = choice
+        # Optional Ollama model token, kept intact (hyphens preserved):
+        #   /prompt-coach:backend ollama qwen2.5-coder:32b-instruct-q4_K_M
+        if choice == "ollama" and len(raw) > 2 and raw[2].strip():
+            gconf_updates["ollama_model"] = raw[2].strip()
+        write_to = "global"
     elif action != "status":
         sys.stderr.write(_usage(env))
         return 2
 
-    if action != "status":
+    if write_to == "state":
         # Self-document which project a project-scoped file belongs to (the name
         # is hashed; this makes `cat state.<x>.json` tell you the path).
         if (env.get("COACH_STATE_SCOPE") or "project").strip().lower() == "project":
@@ -1236,9 +1520,20 @@ def _control(argv, env):
         except OSError as exc:
             sys.stderr.write("could not write state file: %r\n" % (exc,))
             return 1
+    elif write_to == "global":
+        err = save_global_config(env, gconf_updates)
+        if err:
+            sys.stderr.write(err + "\n")
+            return 1
 
     cfg = load_config(env)
     scope = (env.get("COACH_STATE_SCOPE") or "project").strip().lower()
+    # Show the model when the backend is Ollama: it MUST be a model you've pulled,
+    # or the call fails (and the hook stays silent). Naming it here makes the
+    # requirement visible at a glance.
+    backend_label = cfg["backend"]
+    if cfg["backend"] == "ollama":
+        backend_label = "ollama (%s)" % cfg["ollama_model"]
     print(
         "prompt-coach: power %s | evaluate: %s | correct: %s | translate: %s"
         % (
@@ -1249,9 +1544,30 @@ def _control(argv, env):
         )
     )
     print(
-        "native %s, practicing %s | scope: %s | state file: %s"
-        % (cfg["native"], cfg["target"], scope, state_path(env))
+        "native %s, practicing %s | backend: %s | scope: %s"
+        % (cfg["native"], cfg["target"], backend_label, scope)
     )
+    # In project scope there are two files (per-project features + global config);
+    # in global scope they are the same single file.
+    if state_path(env) == config_path(env):
+        print("config (global, all settings): %s" % config_path(env))
+    else:
+        print("features (this project): %s" % state_path(env))
+        print("global config (backend/lang, cross-platform): %s" % config_path(env))
+    if cfg["backend"] == "ollama":
+        print(
+            "ollama: %s — ensure it's pulled (`ollama pull %s`); "
+            "change with %s"
+            % (cfg["ollama_model"], cfg["ollama_model"], _cmd(env, "backend ollama <model>"))
+        )
+    # Flag the hidden optional dependency for API backends instead of failing
+    # silently when the SDK isn't installed.
+    sdk = required_api_sdk(cfg)
+    if sdk and not _sdk_installed(sdk):
+        print(
+            "backend '%s' needs the %s SDK (not installed) — `pip install %s`"
+            % (cfg["backend"], sdk, sdk)
+        )
     # Guide a new user out of the all-off default state.
     if cfg["disabled"]:
         print("hook is OFF — turn it on: " + _cmd(env, "power on"))
@@ -1282,6 +1598,11 @@ def dry_run(argv):
             % cfg["platform"]
         )
         return 1
+    # Mirror the hook: suppress language coaching on a pasted log/code dump, and
+    # cap an over-long prompt to a head+tail excerpt.
+    if cfg["skip_lang_on_paste"] and _is_paste_dominant(prompt):
+        cfg = {**cfg, "coach_language": False}
+    prompt = _excerpt_prompt(prompt, cfg["max_prompt_chars"])
     try:
         analysis = gate_axes(analyze(prompt, cfg), cfg)
     except Exception as exc:
@@ -1323,15 +1644,28 @@ def main():
     if should_skip(prompt, cfg["min_chars"]):
         sys.exit(0)
 
+    # When the prompt is mostly a pasted log/stack trace/code dump, correcting its
+    # "English" is noise — suppress the language axis (keep prompt-quality
+    # coaching). If that leaves nothing enabled, skip the model call entirely.
+    if cfg["skip_lang_on_paste"] and _is_paste_dominant(prompt):
+        cfg = {**cfg, "coach_language": False}
+        if not _anything_to_coach(cfg):
+            sys.exit(0)
+
     context = read_recent_context(
         event.get("transcript_path"),
         prompt,
         cfg["context_messages"],
         cfg["context_chars"],
+        cfg["context_per_msg_chars"],
     )
 
+    # Cap an over-long prompt to a head+tail excerpt so a huge paste can't blow
+    # past the timeout. (Context echo-drop above used the full prompt.)
+    prompt_for_model = _excerpt_prompt(prompt, cfg["max_prompt_chars"])
+
     try:
-        analysis = analyze(prompt, cfg, context)
+        analysis = analyze(prompt_for_model, cfg, context)
     except Exception as exc:  # never break the user's workflow
         if cfg["debug"]:
             sys.stderr.write("prompt-coach error: %r\n" % (exc,))

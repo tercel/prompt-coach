@@ -202,9 +202,11 @@ class TestLangModeAndState(unittest.TestCase):
 
         self.assertEqual(codex_path, claude_path)
         self.assertIn(os.path.join(".config", "prompt-coach"), codex_path)
+        # No project dir -> the single global config file IS the feature store
+        # (no separate state.json).
         self.assertEqual(
             explicit_path,
-            os.path.join("/tmp/prompt-coach-state", "state.json"),
+            os.path.join("/tmp/prompt-coach-state", "config.json"),
         )
 
     def test_state_scope_global_is_shared(self):
@@ -223,10 +225,15 @@ class TestLangModeAndState(unittest.TestCase):
             a = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/a"))
             b = coach.state_path(self._env(d, CLAUDE_PROJECT_DIR="/proj/b"))
             self.assertNotEqual(a, b)
-            # No resolvable project dir -> falls back to the shared file.
+            # No resolvable project dir -> the global config.json is the store.
             self.assertEqual(
                 os.path.basename(coach.state_path({"COACH_STATE_DIR": d})),
-                "state.json",
+                "config.json",
+            )
+            # global scope: features live in config.json, not a separate state.json
+            self.assertEqual(
+                coach.state_path(self._env(d, COACH_STATE_SCOPE="global")),
+                coach.config_path(self._env(d)),
             )
 
     def test_state_scope_project_isolates(self):
@@ -315,6 +322,106 @@ class TestLangModeAndState(unittest.TestCase):
     def test_control_bad_action_returns_2(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(coach._control(["--ctl", "bogus"], self._env(d)), 2)
+
+    def test_backend_default_is_auto(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach.load_config(self._env(d))["backend"], "auto")
+
+    def test_control_backend_persists_and_overrides_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_BACKEND="cli")
+            self.assertEqual(coach._control(["--ctl", "backend", "ollama"], env), 0)
+            self.assertEqual(coach.load_config(env)["backend"], "ollama")
+
+    def test_control_backend_accepts_known_choices(self):
+        with tempfile.TemporaryDirectory() as d:
+            for choice in ("auto", "cli", "api", "ollama"):
+                env = self._env(d)
+                self.assertEqual(
+                    coach._control(["--ctl", "backend", choice], env), 0, choice
+                )
+                self.assertEqual(coach.load_config(env)["backend"], choice)
+
+    def test_control_backend_rejects_unknown_and_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach._control(["--ctl", "backend", "bogus"], self._env(d)), 2)
+            self.assertEqual(coach._control(["--ctl", "backend"], self._env(d)), 2)
+
+    def test_control_backend_ollama_persists_model_with_hyphens(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            model = "qwen2.5-coder:32b-instruct-q4_K_M"
+            # argv arrives as separate tokens (shell-split on spaces); the model
+            # name keeps its hyphens because the backend branch reads raw argv.
+            rc = coach._control(["--ctl", "backend", "ollama", model], env)
+            self.assertEqual(rc, 0)
+            cfg = coach.load_config(env)
+            self.assertEqual(cfg["backend"], "ollama")
+            self.assertEqual(cfg["ollama_model"], model)
+
+    def test_state_ollama_model_overrides_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_OLLAMA_MODEL="llama3.1")
+            coach._control(["--ctl", "backend", "ollama", "phi4:latest"], env)
+            self.assertEqual(coach.load_config(env)["ollama_model"], "phi4:latest")
+
+    def test_backend_ollama_without_model_keeps_env_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d, COACH_OLLAMA_MODEL="mymodel:latest")
+            coach._control(["--ctl", "backend", "ollama"], env)
+            cfg = coach.load_config(env)
+            self.assertEqual(cfg["backend"], "ollama")
+            self.assertEqual(cfg["ollama_model"], "mymodel:latest")
+
+    def test_default_timeout_is_60(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(coach.load_config(self._env(d))["timeout"], 60.0)
+
+    def test_ollama_backend_available_with_host_and_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_BACKEND="ollama"))
+            self.assertTrue(coach.backend_available(cfg))
+
+    def test_analyze_dispatches_to_ollama(self):
+        cfg = coach.load_config(self._env("/tmp/x", COACH_BACKEND="ollama"))
+        with mock.patch.object(coach, "_analyze_ollama", return_value={"ok": 1}) as m:
+            self.assertEqual(coach.analyze("hi there friend", cfg, ""), {"ok": 1})
+            m.assert_called_once()
+
+    def test_analyze_ollama_parses_native_chat_response(self):
+        cfg = coach.load_config(self._env("/tmp/x", COACH_BACKEND="ollama"))
+        payload = json.dumps({
+            "language": {"has_issues": False, "corrections": [], "improved": ""},
+            "prompt": {"has_issues": True, "improved": "Do X in file Y.", "guidance": "name the file"},
+        })
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"message": {"content": payload}}).encode("utf-8")
+
+        with mock.patch("urllib.request.urlopen", return_value=_Resp()) as m:
+            out = coach._analyze_ollama("hi there friend", cfg, "")
+            self.assertTrue(out["prompt"]["has_issues"])
+            self.assertEqual(out["prompt"]["improved"], "Do X in file Y.")
+            # POST to the native chat endpoint with a schema-constrained format.
+            req = m.call_args[0][0]
+            self.assertTrue(req.full_url.endswith("/api/chat"))
+            sent = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(sent["format"], coach.ANALYSIS_SCHEMA)
+            self.assertFalse(sent["stream"])
+            self.assertEqual(sent["keep_alive"], "30m")  # default keeps model resident
+
+    def test_ollama_keep_alive_configurable(self):
+        cfg = coach.load_config(self._env("/tmp/x", COACH_OLLAMA_KEEP_ALIVE="2h"))
+        self.assertEqual(cfg["ollama_keep_alive"], "2h")
+        cfg_default = coach.load_config(self._env("/tmp/x"))
+        self.assertEqual(cfg_default["ollama_keep_alive"], "30m")
 
     def test_features_default_off(self):
         with tempfile.TemporaryDirectory() as d:
@@ -695,7 +802,7 @@ class TestLoadConfig(unittest.TestCase):
 
     def test_bad_timeout_falls_back(self):
         cfg = coach.load_config({"COACH_TIMEOUT": "soon"})
-        self.assertEqual(cfg["timeout"], 25.0)
+        self.assertEqual(cfg["timeout"], 60.0)
 
 
 class TestBackendAvailable(unittest.TestCase):
@@ -1097,6 +1204,222 @@ class TestBuildContext(unittest.TestCase):
         out = coach.build_context(msgs, "", 6, 50)
         self.assertTrue(out.startswith("…"))
         self.assertLessEqual(len(out), 51)
+
+
+class TestExampleFiles(unittest.TestCase):
+    """The shipped templates must stay in sync with what the code consumes."""
+
+    _ROOT = os.path.join(os.path.dirname(__file__), "..")
+    # config.json may also hold feature toggles + power when scope is global.
+    _CONFIG_KEYS = {
+        "backend", "ollama_model", "ollama_host", "ollama_keep_alive",
+        "native", "target", "enabled", "evaluate", "correct", "translate",
+    }
+    _STATE_KEYS = {"enabled", "evaluate", "correct", "translate", "project"}
+
+    def test_config_example_is_valid_and_known_keys(self):
+        with open(os.path.join(self._ROOT, "config.example.json")) as fh:
+            data = json.load(fh)
+        self.assertIsInstance(data, dict)
+        self.assertTrue(set(data).issubset(self._CONFIG_KEYS), set(data) - self._CONFIG_KEYS)
+        self.assertIn(data["backend"], coach._BACKENDS)
+
+    def test_state_example_is_valid_and_known_keys(self):
+        with open(os.path.join(self._ROOT, "state.project.example.json")) as fh:
+            data = json.load(fh)
+        self.assertIsInstance(data, dict)
+        self.assertTrue(set(data).issubset(self._STATE_KEYS), set(data) - self._STATE_KEYS)
+
+    def test_config_example_loads_through_load_config(self):
+        # Copying the template into the state dir must yield the configured backend.
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(
+                os.path.join(self._ROOT, "config.example.json"),
+                os.path.join(d, "config.json"),
+            )
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            self.assertEqual(cfg["backend"], "ollama")
+            self.assertEqual(cfg["ollama_model"], "qwen2.5-coder:32b-instruct-q4_K_M")
+            self.assertEqual(cfg["native"], "Chinese")
+
+
+class TestConfigStateSplit(unittest.TestCase):
+    """backend/lang are written to the cross-platform GLOBAL config file;
+    feature toggles stay in the per-project state file."""
+
+    def _env(self, tmpdir, **extra):
+        env = {"PATH": "", "COACH_STATE_DIR": tmpdir, "CLAUDE_PROJECT_DIR": "/work/Proj"}
+        env.update(extra)
+        return env
+
+    def test_backend_writes_global_config_not_project_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "backend", "ollama", "qwen2.5-coder:32b"], env)
+            gconf = coach.load_global_config(env)
+            self.assertEqual(gconf["backend"], "ollama")
+            self.assertEqual(gconf["ollama_model"], "qwen2.5-coder:32b")
+            # project state must NOT carry backend/model
+            self.assertNotIn("backend", coach.load_state(env))
+            self.assertNotIn("ollama_model", coach.load_state(env))
+
+    def test_lang_writes_global_config_not_project_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "lang", "native", "Chinese", "target", "English"], env)
+            gconf = coach.load_global_config(env)
+            self.assertEqual(gconf.get("native"), "Chinese")
+            self.assertEqual(gconf.get("target"), "English")
+            self.assertNotIn("native", coach.load_state(env))
+
+    def test_features_write_project_state_not_global_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach._control(["--ctl", "enable", "correct", "translate"], env)
+            self.assertTrue(coach.load_state(env).get("correct"))
+            self.assertEqual(coach.load_global_config(env), {})  # nothing written here
+
+    def test_global_config_applies_under_project_scope(self):
+        # Different projects share the SAME global backend (config.json), while
+        # their feature toggles stay isolated.
+        with tempfile.TemporaryDirectory() as d:
+            a = self._env(d, CLAUDE_PROJECT_DIR="/work/A")
+            b = self._env(d, CLAUDE_PROJECT_DIR="/work/B")
+            coach._control(["--ctl", "backend", "ollama", "m:1"], a)
+            self.assertEqual(coach.load_config(a)["backend"], "ollama")
+            self.assertEqual(coach.load_config(b)["backend"], "ollama")  # shared
+            coach._control(["--ctl", "enable", "correct"], a)
+            self.assertTrue(coach.load_config(a)["correct_on"])
+            self.assertFalse(coach.load_config(b)["correct_on"])         # isolated
+
+    def test_global_scope_features_live_in_config_json(self):
+        # In global scope there is no separate state.json: features and backend
+        # share the one config.json, and neither write clobbers the other.
+        with tempfile.TemporaryDirectory() as d:
+            genv = {"PATH": "", "COACH_STATE_DIR": d, "COACH_STATE_SCOPE": "global"}
+            coach._control(["--ctl", "backend", "ollama", "m:1"], genv)
+            coach._control(["--ctl", "enable", "correct", "translate"], genv)
+            conf = coach.load_global_config(genv)
+            self.assertEqual(conf["backend"], "ollama")      # backend preserved
+            self.assertTrue(conf["correct"])                 # feature stored here
+            self.assertTrue(conf["translate"])
+            # no standalone state.json was created
+            self.assertFalse(os.path.exists(os.path.join(d, "state.json")))
+            cfg = coach.load_config(genv)
+            self.assertTrue(cfg["correct_on"])
+            self.assertEqual(cfg["backend"], "ollama")
+
+    def test_project_state_backend_overrides_global_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._env(d)
+            coach.save_global_config(env, {"backend": "ollama"})
+            # a stale/explicit project-state backend still wins (most specific)
+            coach._control(["--ctl", "enable", "correct"], env)  # create state file
+            import json as _json
+            sp = coach.state_path(env)
+            data = _json.load(open(sp)); data["backend"] = "api"; _json.dump(data, open(sp, "w"))
+            self.assertEqual(coach.load_config(env)["backend"], "api")
+
+
+class TestRequiredApiSdk(unittest.TestCase):
+    def _cfg(self, backend, platform="codex"):
+        return {"backend": backend, "platform": platform}
+
+    def test_cli_and_ollama_need_no_sdk(self):
+        for b in ("auto", "cli", "claude", "codex", "ollama"):
+            self.assertIsNone(coach.required_api_sdk(self._cfg(b)))
+            self.assertIsNone(coach.required_api_sdk(self._cfg(b, "claude")))
+
+    def test_explicit_api_backends_map_to_sdk(self):
+        self.assertEqual(coach.required_api_sdk(self._cfg("openai")), "openai")
+        self.assertEqual(coach.required_api_sdk(self._cfg("anthropic")), "anthropic")
+
+    def test_api_alias_is_platform_aware(self):
+        self.assertEqual(coach.required_api_sdk(self._cfg("api", "claude")), "anthropic")
+        self.assertEqual(coach.required_api_sdk(self._cfg("api", "codex")), "openai")
+
+    def test_sdk_installed_detects_present_and_absent(self):
+        self.assertTrue(coach._sdk_installed("json"))          # stdlib, always present
+        self.assertFalse(coach._sdk_installed("no_such_pkg_xyz"))
+
+
+class TestPasteAndExcerpt(unittest.TestCase):
+    def test_plain_prose_is_not_paste(self):
+        self.assertFalse(coach._is_paste_dominant(
+            "Help me optimize the database query, it is slow on large tables."
+        ))
+
+    def test_short_multiline_prose_is_not_paste(self):
+        self.assertFalse(coach._is_paste_dominant(
+            "First do X\nThen do Y\nFinally check Z"
+        ))
+
+    def test_fenced_code_block_is_paste(self):
+        self.assertTrue(coach._is_paste_dominant(
+            "what's wrong here?\n```\ndef f():\n    return 1/0\n```"
+        ))
+
+    def test_stack_trace_is_paste(self):
+        log = "fix this:\n" + "\n".join([
+            "Traceback (most recent call last):",
+            '  File "app.py", line 10, in <module>',
+            "    main()",
+            '  File "app.py", line 5, in main',
+            "    1 / 0",
+            "ZeroDivisionError: division by zero",
+            "2024-01-02 12:00:00 ERROR boom",
+            "  at com.foo.Bar(Bar.java:42)",
+            "  at com.foo.Baz(Baz.java:7)",
+        ])
+        self.assertTrue(coach._is_paste_dominant(log))
+
+    def test_excerpt_short_prompt_unchanged(self):
+        self.assertEqual(coach._excerpt_prompt("hello world", 4000), "hello world")
+
+    def test_excerpt_long_prompt_keeps_head_and_tail(self):
+        s = "HEAD_MARKER " + ("x " * 5000) + "TAIL_MARKER"
+        out = coach._excerpt_prompt(s, 200)
+        self.assertIn("HEAD_MARKER", out)
+        self.assertIn("TAIL_MARKER", out)
+        self.assertIn("trimmed", out)
+        self.assertLess(len(out), len(s))
+
+    def test_paste_suppresses_language_via_anything_to_coach(self):
+        # correct-only config + a pasted log -> language off -> nothing to coach.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_CORRECT="on"))
+            self.assertTrue(coach._anything_to_coach(cfg))
+            cfg2 = {**cfg, "coach_language": False}
+            self.assertFalse(coach._anything_to_coach(cfg2))
+
+    def _env(self, tmpdir, **extra):
+        env = {"PATH": "", "COACH_STATE_DIR": tmpdir}
+        env.update(extra)
+        return env
+
+
+class TestContextCodeStripping(unittest.TestCase):
+    def test_code_block_replaced_with_marker(self):
+        msgs = [("assistant", "Here is the fix:\n```python\n" + ("a = 1\n" * 200) + "```\nDone.")]
+        out = coach.build_context(msgs, "", 6, 2000, per_msg_chars=600)
+        self.assertIn("[code]", out)
+        self.assertNotIn("a = 1 a = 1", out)   # code body did not survive
+        self.assertIn("Here is the fix", out)
+        self.assertIn("Done.", out)
+
+    def test_truncation_snaps_to_word_boundary(self):
+        msgs = [("user", "alpha beta gamma delta epsilon zeta eta theta iota kappa")]
+        out = coach.build_context(msgs, "", 6, 2000, per_msg_chars=20)
+        self.assertTrue(out.endswith("…"))
+        self.assertNotIn("epsilo…", out)       # not cut mid-word
+
+    def test_per_msg_chars_configurable(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(
+                {"COACH_STATE_DIR": d, "COACH_CONTEXT_PER_MSG_CHARS": "120"}
+            )
+            self.assertEqual(cfg["context_per_msg_chars"], 120)
+            self.assertEqual(coach.load_config({"COACH_STATE_DIR": d})["context_per_msg_chars"], 600)
 
 
 class TestUserContent(unittest.TestCase):

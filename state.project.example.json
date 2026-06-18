@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "evaluate": true,
+  "correct": true,
+  "translate": true,
+  "project": "/Users/you/path/to/your-project"
+}

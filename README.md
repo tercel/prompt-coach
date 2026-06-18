@@ -122,7 +122,7 @@ In that case point the `command` at the working copy with an absolute path —
 | Variable | Default | Meaning |
 |---|---|---|
 | `COACH_PLATFORM` | `auto` | `auto`, `claude`, or `codex`. |
-| `COACH_BACKEND` | `auto` | `auto`, `cli`, `api`, `claude`, `anthropic`, `codex`, or `openai`. |
+| `COACH_BACKEND` | `auto` | `auto`, `cli`, `api`, `ollama`, `claude`, `anthropic`, `codex`, or `openai`. Settable persistently via `/prompt-coach:backend`. |
 | `COACH_CLAUDE_BIN` | PATH lookup | Explicit Claude CLI path. |
 | `COACH_CODEX_BIN` | PATH lookup | Explicit Codex CLI path. |
 | `ANTHROPIC_API_KEY` | unset | Enables Anthropic API fallback. |
@@ -131,6 +131,9 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Claude CLI and Anthropic API model. |
 | `COACH_CLI_MODEL` | agent default | Codex CLI model. |
 | `COACH_API_MODEL` | `gpt-4o-mini` | OpenAI API model. |
+| `COACH_OLLAMA_HOST` | `http://localhost:11434` | Ollama server base URL (`ollama` backend). |
+| `COACH_OLLAMA_MODEL` | `llama3.1` | Ollama model (`ollama` backend). For quality, use a strong instruct model, e.g. `qwen2.5-coder:32b-instruct-q4_K_M`. |
+| `COACH_OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model resident between calls (avoids cold-load latency on intermittent hook use). |
 | `COACH_TARGET_LANG` | `English` | Language being practiced. |
 | `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
 | `COACH_LEVEL` | `Advanced` | Feedback depth. |
@@ -144,7 +147,7 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
 | `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
 | `COACH_CONTEXT_CHARS` | `2000` | Maximum rendered context characters. |
-| `COACH_TIMEOUT` | `25` | Backend timeout in seconds. |
+| `COACH_TIMEOUT` | `60` | Backend timeout in seconds. The nested CLI backend can take 15–25s+; too low a value silently drops coaching when a call overruns it. |
 | `COACH_DISABLE` | unset | Set truthy to disable. |
 | `COACH_DEBUG` | unset | Set truthy to print errors. |
 
@@ -156,10 +159,27 @@ COACH_BACKEND=claude    # force Claude CLI
 COACH_BACKEND=anthropic # force Anthropic API
 COACH_BACKEND=codex     # force Codex CLI
 COACH_BACKEND=openai    # force OpenAI API
+COACH_BACKEND=ollama    # force a local Ollama server (COACH_OLLAMA_HOST / COACH_OLLAMA_MODEL)
 ```
 
 If `COACH_NATIVE_LANG` explicitly equals `COACH_TARGET_LANG`, only prompt
 quality coaching runs.
+
+### Dependencies (the API backends are the only ones with extras)
+
+The default paths are **standard-library only** — CLI backends shell out via
+`subprocess`, and the `ollama` backend uses `urllib`. No `pip install` required.
+
+The direct HTTP **API** backends (`COACH_BACKEND=api | openai | anthropic`) need
+an optional SDK, imported lazily and listed in [`requirements.txt`](requirements.txt):
+
+```bash
+pip install anthropic   # Claude / Anthropic API backend
+pip install openai      # Codex / OpenAI API backend
+```
+
+If you select an API backend without its SDK, `/prompt-coach:status` flags the
+missing package instead of failing silently.
 
 ## Which prompts get coached
 
@@ -196,6 +216,7 @@ with no restart — taking effect on your next prompt:
 | `/prompt-coach:enable <feature…>` | Turn one or more features **on** |
 | `/prompt-coach:disable <feature…>` | Turn one or more features **off** |
 | `/prompt-coach:lang native <X> target <Y>` | Set your native / practiced language (name or code, e.g. `native zh target en`) |
+| `/prompt-coach:backend <auto\|cli\|api\|ollama> [model]` | Choose the analysis engine (auto=CLI default; api/ollama are faster, more reliable). For `ollama`, pass a pulled model, e.g. `backend ollama qwen2.5-coder:32b-instruct-q4_K_M` — it persists, no global config needed |
 | `/prompt-coach:status` | Show current state (each feature, scope, state-file path) |
 | `/prompt-coach:help [en\|zh]` | Show the command usage (English or Chinese) |
 
@@ -254,9 +275,74 @@ set for the hook but not for the control command subprocess, so keying off them
 would make the command and the hook read different files (your toggles would
 silently never apply).
 
+### Where settings live: global config vs per-project state
+
+prompt-coach keeps two files under `~/.config/prompt-coach/` (override the dir with
+`COACH_STATE_DIR`):
+
+| File | Holds | Written by | Scope |
+|---|---|---|---|
+| `config.json` | backend, Ollama model/host/keep-alive, native/target language — **plus the feature toggles when scope is `global`** | `/prompt-coach:backend`, `/prompt-coach:lang`; `/prompt-coach:enable`/`disable`/`power` (in global scope) | **Global, cross-platform** — one file both Claude and Codex read |
+| `state.<project>.<hash>.json` | `evaluate` / `correct` / `translate` toggles, power | `/prompt-coach:enable` / `disable` / `power` (in project scope) | **Per-project** (the default scope) |
+
+There is **one global file** (`config.json`), not two: in `global` scope the feature
+toggles live in `config.json` alongside backend/language, so there is no separate
+`state.json`. Only **project** scope adds the per-project `state.<project>.<hash>.json`
+files — because a single global file can't hold per-project toggles.
+
+Why a dedicated `config.json` instead of host settings: `~/.claude/settings.json`
+is Claude-only and `~/.codex/config.toml` is Codex-only — neither is shared. A file
+in the prompt-coach home dir is the one place both hooks read, so your backend and
+language are set once and apply everywhere.
+
+Resolution: per-project state `>` `config.json` `>` env (`COACH_*`) `>` built-in
+default. Feature toggles live in the per-project state file (project scope) **or in
+`config.json` (global scope)** — they are not inherited across scopes.
+
+#### File templates and schema
+
+Both files are created on demand by the `/prompt-coach:*` commands — **you never
+need to create them**, and a fresh install with neither file just uses built-in
+defaults (everything off). The repo ships [`config.example.json`](config.example.json)
+(templates the global `config.json`) and
+[`state.project.example.json`](state.project.example.json) (templates a per-project
+`state.<project>.<hash>.json`) for reference; to hand-edit, copy a template (JSON has
+no comments, so the keys are documented below):
+
+```bash
+mkdir -p ~/.config/prompt-coach
+cp config.example.json ~/.config/prompt-coach/config.json   # then edit
+```
+
+`config.json` — the single global, cross-platform file (every key optional; omit to
+use the default):
+
+| Key | Values | Default |
+|---|---|---|
+| `backend` | `auto` · `cli` · `api` · `ollama` · `codex` · `openai` · `claude` · `anthropic` | `auto` |
+| `ollama_model` | any pulled Ollama model tag | `llama3.1` |
+| `ollama_host` | Ollama base URL | `http://localhost:11434` |
+| `ollama_keep_alive` | Ollama keep-alive duration (e.g. `30m`, `2h`, `-1` = forever) | `30m` |
+| `native` | your native language (name or code) | locale-detected |
+| `target` | language you're practicing | `English` |
+| `enabled` / `evaluate` / `correct` / `translate` | **global scope only** — the feature toggles below, when `COACH_STATE_SCOPE=global` | see state table |
+
+`state.<project>.<hash>.json` — per-project feature toggles (the filename is
+auto-derived; `project` is written automatically so `cat` tells you which path it
+belongs to). Only created in the default **project** scope:
+
+| Key | Values | Default |
+|---|---|---|
+| `enabled` | `true` / `false` — the master power switch | `true` (absent ⇒ on) |
+| `evaluate` | `true` / `false` — prompt-quality coaching | `false` |
+| `correct` | `true` / `false` — correct target-language writing | `false` |
+| `translate` | `true` / `false` — render native input in the target | `false` |
+| `project` | absolute project path (auto-written) | — |
+
 ### Toggle scope (`COACH_STATE_SCOPE`)
 
-How widely a `/prompt-coach:*` toggle reaches:
+How widely a `/prompt-coach:*` **feature** toggle reaches (backend/lang are always
+global — see above):
 
 | Scope | Behavior |
 |---|---|

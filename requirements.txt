@@ -1,0 +1,16 @@
+# prompt-coach — OPTIONAL dependencies.
+#
+# The default path needs NOTHING beyond the Python standard library:
+#   - CLI backends (auto/cli/claude/codex) shell out via subprocess
+#   - the ollama backend talks to the local server via urllib
+#
+# The third-party SDKs below are ONLY required if you select a direct HTTP API
+# backend (COACH_BACKEND=api | openai | anthropic). Install just the one you use:
+#
+#   pip install anthropic          # for the Claude / Anthropic API backend
+#   pip install openai             # for the Codex / OpenAI API backend
+#
+# Or install both at once with:  pip install -r requirements.txt
+
+anthropic>=0.40.0   # _analyze_anthropic_api: Messages API + tool use
+openai>=1.66.0      # _analyze_api: Responses API + structured output (json_schema)

@@ -13,4 +13,6 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/coach.py" --ctl lang $ARGUMENTS
 e.g. `native Chinese target English`. Each language may be a full name or a code:
 `zh`/`en`/`ja`/`jp`/`kr`… → Chinese/English/Japanese/Korean. `native` is the language
 you speak (used for explanations); `target` is the language you're practicing.
-Persists across sessions; overrides `COACH_NATIVE_LANG` / `COACH_TARGET_LANG`.
+Saved to the cross-platform global config (`~/.config/prompt-coach/config.json`),
+so it applies to every project and to both Claude and Codex; overrides
+`COACH_NATIVE_LANG` / `COACH_TARGET_LANG`.
