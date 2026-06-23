@@ -485,9 +485,15 @@ class TestLangModeAndState(unittest.TestCase):
             self.assertEqual(coach._control(["--ctl", "power-off"], env), 0)
             self.assertTrue(coach.load_config(env)["disabled"])
 
-    def test_enable_requires_a_feature(self):
+    def test_enable_no_args_enables_all(self):
+        # Desktop strips $ARGUMENTS — no-arg enable should enable all features.
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(coach._control(["--ctl", "enable"], self._env(d)), 2)
+            env = self._env(d)
+            self.assertEqual(coach._control(["--ctl", "enable"], env), 0)
+            state = coach.load_state(env)
+            self.assertTrue(state.get("evaluate"))
+            self.assertTrue(state.get("correct"))
+            self.assertTrue(state.get("translate"))
 
     def test_enable_unknown_feature_returns_2(self):
         with tempfile.TemporaryDirectory() as d:

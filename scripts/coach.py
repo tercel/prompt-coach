@@ -1465,8 +1465,11 @@ def _control(argv, env):
         state["enabled"] = val
         write_to = "state"
     elif action in ("enable", "disable"):
+        # No features specified → default to all (supports Desktop where $ARGUMENTS is stripped).
+        if not rest:
+            rest = list(_FEATURES.keys())
         resolved = [_resolve_feature(f) for f in rest]
-        if not rest or any(r is None for r in resolved):
+        if any(r is None for r in resolved):
             sys.stderr.write(_usage(env))
             return 2
         for feature in resolved:
