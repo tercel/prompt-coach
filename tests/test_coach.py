@@ -648,7 +648,8 @@ class TestLangModeAndState(unittest.TestCase):
                 )
             )
             sysp = coach._system(cfg)
-            self.assertIn("render it", sysp)
+            self.assertIn("render the WHOLE prompt", sysp)
+            self.assertIn("MIXED", sysp)
             self.assertIn("Chinese", sysp)
 
     def test_system_prompt_correct_mode_is_default(self):
