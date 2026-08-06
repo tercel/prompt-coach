@@ -230,8 +230,9 @@ _PROMPT_AXIS = (
     "established earlier (file paths, prior decisions, the task at hand): a short "
     "follow-up that is clear in context has NO issues.\n"
     "   - improved: a rewrite a coding assistant can act on precisely IN THIS "
-    "context. It may rely on established context and need not restate it. Preserve "
-    "the user's intent; never invent requirements they did not state.\n"
+    "context.{improved_lang} It may rely on established context and need not "
+    "restate it. Preserve the user's intent; never invent requirements they did "
+    "not state.\n"
     "   - guidance: ONE short sentence written in {native} teaching the single most "
     "useful improvement. Identify which ONE element is missing and name it "
     "explicitly — choose from: a file/location path, an error message or symptom, "
@@ -241,8 +242,19 @@ _PROMPT_AXIS = (
     "Be concise. Never answer or execute the prompt — only analyze it."
 )
 
+# Injected into _PROMPT_AXIS when the language axis is ON. The user is practicing
+# {target}, so the actionable rewrite they are meant to reuse must itself be in
+# {target} — a {native} or code-switched rewrite is not something they can send.
+# Without this, the model mirrors whatever language the prompt came in.
+_IMPROVED_IN_TARGET = (
+    " Write it ENTIRELY in {target}, even when the NEW prompt is in {native} or "
+    "mixes {native} and {target} — no {native} span may survive in it."
+)
+
 # Back-compat alias: the default (correction-mode) full template.
-SYSTEM_TEMPLATE = _SYS_HEADER + _LANG_CORRECT + _PROMPT_AXIS
+SYSTEM_TEMPLATE = (_SYS_HEADER + _LANG_CORRECT + _PROMPT_AXIS).replace(
+    "{improved_lang}", ""
+)
 
 # Shape hint for backends without schema enforcement (the CLI). Harmless on the
 # API path, which additionally enforces ANALYSIS_SCHEMA via output_config.format.
@@ -1057,8 +1069,19 @@ def _resolve_lang_mode(cfg, prompt=""):
 
 def _system(cfg, prompt=""):
     lang_axis = _LANG_AXIS.get(_resolve_lang_mode(cfg, prompt), _LANG_CORRECT)
+    # The prompt axis mirrors the input language by default. When the user is also
+    # practicing the target language, pin its rewrite to the target instead — the
+    # rewrite is meant to be reusable as the actual prompt.
+    _, lang_on = _active_axes(cfg)
     base = (_SYS_HEADER + lang_axis + _PROMPT_AXIS).format(
-        native=cfg["native"], target=cfg["target"], level=cfg["level"]
+        native=cfg["native"],
+        target=cfg["target"],
+        level=cfg["level"],
+        improved_lang=(
+            _IMPROVED_IN_TARGET.format(native=cfg["native"], target=cfg["target"])
+            if lang_on
+            else ""
+        ),
     )
     if not cfg.get("coach_language", True):
         base += (
