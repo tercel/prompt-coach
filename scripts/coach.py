@@ -263,7 +263,9 @@ JSON_SHAPE_HINT = (
     "exactly this shape:\n"
     '{"language":{"has_issues":<bool>,"corrections":'
     '[{"original":<str>,"correction":<str>,"explanation":<str>}],"improved":<str>},'
-    '"prompt":{"has_issues":<bool>,"improved":<str>,"guidance":<str>}}'
+    '"prompt":{"has_issues":<bool>,"improved":<str>,"guidance":<str>}}\n'
+    'Inside every string value, escape literal double-quote characters as \\" '
+    "(or use single quotes /「」 instead) — an unescaped \" breaks JSON parsing."
 )
 
 
@@ -1284,6 +1286,14 @@ def _analyze_ollama(prompt, cfg, context=""):
     Uses the stdlib only (no SDK) so the hook stays dependency-free. Structured
     output is requested via Ollama's `format` field set to the JSON schema, so the
     model returns a schema-conforming object directly in message.content.
+
+    `think: false` disables extended reasoning on models that support it (e.g.
+    qwen3-family thinking models). Without it, such a model burns tens to
+    hundreds of seconds generating a hidden chain-of-thought before the actual
+    JSON — routinely exceeding COACH_TIMEOUT and making the hook silently drop
+    coaching (by design, any error is swallowed). Measured on qwen3.5:27b-mlx:
+    16s with think=false vs. 73-280s+ without it, for identical output. Ollama
+    ignores the field harmlessly on models without thinking support.
     """
     import urllib.request
 
@@ -1291,6 +1301,7 @@ def _analyze_ollama(prompt, cfg, context=""):
         "model": cfg["ollama_model"],
         "stream": False,
         "format": ANALYSIS_SCHEMA,
+        "think": False,
         "options": {"temperature": 0},
         # Keep the model resident between prompts so intermittent hook calls don't
         # repeatedly pay the cold model-load cost (Ollama unloads after 5m by default).
