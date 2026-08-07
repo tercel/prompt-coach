@@ -193,7 +193,11 @@ _LANG_TRANSLATE = (
     "   - has_issues: true if ANY part of the prompt is in {native} worth rendering in "
     "{target}. A prompt that mixes {native} and {target} STILL has issues — do not skip "
     "it just because some spans are already in {target}.\n"
-    "   - corrections: the key phrase mappings. Each: original (the {native} span), "
+    "   - corrections: 2-4 of the MOST instructive phrase mappings only — vocabulary "
+    "choice, an idiom, tone, or a grammar point worth learning. Do NOT segment the whole "
+    "sentence into consecutive spans that together just reconstruct 'improved' piece by "
+    "piece; that duplicates it with no teaching value — skip trivial/obvious spans (a "
+    "literal proper noun, a URL, a number). Each: original (the {native} span), "
     "correction (the natural {target} equivalent), explanation (one short clause in "
     "{native} on usage / why).\n"
     "   - improved: a full, natural {target} rendering of the ENTIRE prompt, translating "
@@ -212,6 +216,9 @@ _LANG_AUTO = (
     "translate every {native} span and integrate the existing {target} spans into one "
     "coherent {target} prompt. A mixed prompt always has issues; never skip it just "
     "because some spans are already in {target}.\n"
+    "   - When rendering (native or mixed cases), corrections are 2-4 of the MOST "
+    "instructive mappings only — never a full sequential segmentation of the sentence; "
+    "that just duplicates 'improved' piece by piece with no teaching value.\n"
     "   - has_issues: true when there is anything to correct or render. Explanations are "
     "ALWAYS written in {native}.\n"
     "   If the prompt is already flawless {target}, set has_issues=false, corrections=[], "
@@ -1294,6 +1301,16 @@ def _analyze_ollama(prompt, cfg, context=""):
     coaching (by design, any error is swallowed). Measured on qwen3.5:27b-mlx:
     16s with think=false vs. 73-280s+ without it, for identical output. Ollama
     ignores the field harmlessly on models without thinking support.
+
+    `presence_penalty: 0` overrides whatever default a given model ships with
+    (e.g. qwen3.5:9b-mlx defaults to 1.5). A high presence penalty punishes ANY
+    repeated token, including structural JSON punctuation ({, }, ", :, ,) that
+    necessarily repeats many times across a long schema response — on longer
+    analyses (more correction items) this reliably pushed the model to emit an
+    early stop token before closing the final braces, producing truncated,
+    unparseable JSON. Reproduced deterministically at presence_penalty=1.5
+    (eval_count 577-600, done_reason "stop", JSON missing its closing brace);
+    presence_penalty=0 closed the JSON correctly every time.
     """
     import urllib.request
 
@@ -1302,7 +1319,7 @@ def _analyze_ollama(prompt, cfg, context=""):
         "stream": False,
         "format": ANALYSIS_SCHEMA,
         "think": False,
-        "options": {"temperature": 0},
+        "options": {"temperature": 0, "presence_penalty": 0},
         # Keep the model resident between prompts so intermittent hook calls don't
         # repeatedly pay the cold model-load cost (Ollama unloads after 5m by default).
         "keep_alive": cfg["ollama_keep_alive"],

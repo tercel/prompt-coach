@@ -1,7 +1,7 @@
 {
   "name": "prompt-coach",
   "description": "Dual-axis coaching on every Claude Code prompt: improves prompt quality and target-language expression.",
-  "version": "0.12.4",
+  "version": "0.12.5",
   "author": {
     "name": "tercel"
   }
