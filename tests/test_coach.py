@@ -715,11 +715,8 @@ class TestBuildDelivery(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         payload = json.loads(out)
-        self.assertEqual(
-            payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit"
-        )
-        ctx = payload["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Fix the 401 error in src/auth/login.ts", ctx)
+        self.assertNotIn("hookSpecificOutput", payload)
+        self.assertIn("Fix the 401 error in src/auth/login.ts", payload["systemMessage"])
 
     def test_block_mode(self):
         cfg = coach.load_config({"OPENAI_API_KEY": "x", "COACH_MODE": "block"})

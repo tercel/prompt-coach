@@ -302,7 +302,7 @@ set = {
 
 ## 输出模式
 
-- **`annotate`**：将辅导内容作为额外的开发者上下文注入，然后回答改进后的请求。
+- **`annotate`**：将辅导内容以 `systemMessage` 直接显示在对话记录里。Agent 完全看不到这段内容，仍会照你原始的 prompt 正常回答。
 - **`block`**：以退出码 2 拒绝 prompt，要求重新提交。
 
 ## 本地试用
@@ -334,6 +334,5 @@ python3 tests/test_coach.py -v
 ## 已知限制
 
 - 辅导在 prompt 提交后运行，而非输入时。
-- Annotate 模式依赖当前 agent 遵循注入的显示指令。
 - 每条非平凡 prompt 都会产生一次额外的模型调用。
 - 对话记录解析是尽力而为，因为 agent 对话记录格式不是稳定的公开 API。

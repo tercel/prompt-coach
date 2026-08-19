@@ -404,8 +404,9 @@ machine-wide defaults can live in `~/.codex/config.toml` under
 
 ## Delivery modes
 
-- **`annotate`**: inject coaching as additional developer context, then answer
-  the improved request.
+- **`annotate`**: show the coaching as a `systemMessage` directly in the
+  transcript. The agent never sees it and keeps answering your original
+  prompt unchanged.
 - **`block`**: reject the prompt with exit code 2 and require resubmission.
 
 ## Try locally
@@ -437,8 +438,6 @@ Unit tests do not call external models.
 ## Limitations
 
 - Coaching runs after prompt submission, not while typing.
-- Annotate mode relies on the active agent following the injected display
-  instruction.
 - Every non-trivial prompt creates an additional model call.
 - Transcript parsing is best-effort because agent transcript formats are not
   stable public APIs.

@@ -16,8 +16,9 @@ the same analysis logic is meant to be reused later behind a terminal split-pane
 or a floating panel.
 
 Delivery modes (env COACH_MODE):
-  - "annotate" (default): non-blocking. Injects the coaching as additionalContext
-    so the active coding agent shows it and answers the improved prompt.
+  - "annotate" (default): non-blocking. Shows the coaching as a systemMessage
+    directly in the transcript — the active coding agent never sees it and
+    keeps answering your original prompt unchanged.
   - "block": blocking. Surfaces the coaching and blocks the prompt so you
     consciously resubmit the improved version (a stricter learning loop).
 
@@ -1019,22 +1020,6 @@ def format_coaching(analysis, cfg):
     return "\n".join(lines)
 
 
-def build_additional_context(analysis, cfg, block):
-    """Instruction injected into the active agent's context for annotate mode."""
-    lines = [
-        "[prompt-coach] Coaching for the user, a %s speaker practicing %s (%s level)."
-        % (cfg["native"], cfg["target"], cfg["level"]),
-        "Display the coaching block below to the user VERBATIM at the very start "
-        "of your reply, then answer their request normally.",
-        "",
-        block,
-    ]
-    prm = analysis.get("prompt", {})
-    if prm.get("has_issues") and prm.get("improved"):
-        lines += ["", "Answer this improved version of their request: " + prm["improved"]]
-    return "\n".join(lines)
-
-
 def build_delivery(analysis, cfg):
     """Return (stdout, stderr, exit_code) for the given analysis + config."""
     if not has_any_issues(analysis):
@@ -1045,13 +1030,10 @@ def build_delivery(analysis, cfg):
     if cfg["mode"] == "block":
         return ("", block + "\n", 2)
 
-    # annotate (default): non-blocking context injection
-    payload = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": build_additional_context(analysis, cfg, block),
-        }
-    }
+    # annotate (default): display-only via systemMessage. The active agent
+    # never sees this field, so it keeps answering the user's original prompt
+    # unchanged — the coaching is purely for the human to read and act on.
+    payload = {"systemMessage": block}
     return (json.dumps(payload), "", 0)
 
 
