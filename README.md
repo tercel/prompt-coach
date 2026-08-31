@@ -136,6 +136,12 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_OLLAMA_HOST` | `http://localhost:11434` | Ollama server base URL (`ollama` backend). |
 | `COACH_OLLAMA_MODEL` | `llama3.1` | Ollama model (`ollama` backend). For quality, use a strong instruct model, e.g. `qwen2.5-coder:32b-instruct-q4_K_M`. |
 | `COACH_OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model resident between calls (avoids cold-load latency on intermittent hook use). |
+| `COACH_OLLAMA_AUTOSTART` | `on` | If the `ollama` backend can't reach `COACH_OLLAMA_HOST`, spawn `ollama serve` in the background and wait briefly for it. A healthy server is never touched (one cheap liveness probe per call, no spawn), and a cooldown file stops a missing binary or a crash-looping daemon from being relaunched on every prompt. |
+| `COACH_OLLAMA_BIN` | found on `PATH` | Path to the `ollama` binary, used for autostart. |
+| `COACH_OLLAMA_AUTOSTART_WAIT` | `8` | Seconds to wait for the spawned server to become reachable before giving up on that call (still falls back to the normal swallowed-error behavior). |
+| `COACH_OLLAMA_AUTOSTART_COOLDOWN` | `60` | Minimum seconds between autostart attempts. |
+| `COACH_OLLAMA_REQUIRE_LOADED` | `on` | Check `/api/ps` that the model is already resident before analyzing. If it isn't, hand the cold load to a detached background warm-up and skip coaching for that one prompt. See [Cold starts](#cold-starts-ollama). |
+| `COACH_OLLAMA_WARM_TTL` | `900` | Backstop only. The warm-up releases its own lock the moment the load succeeds, so this never needs tuning to disk speed — it bounds a warm-up that was killed, and doubles as the retry interval for a model that can't load at all. |
 | `COACH_TARGET_LANG` | `English` | Language being practiced. |
 | `COACH_NATIVE_LANG` | locale detection | Language used for explanations. |
 | `COACH_LEVEL` | `Advanced` | Feedback depth. |
@@ -166,6 +172,37 @@ COACH_BACKEND=ollama    # force a local Ollama server (COACH_OLLAMA_HOST / COACH
 
 If `COACH_NATIVE_LANG` explicitly equals `COACH_TARGET_LANG`, only prompt
 quality coaching runs.
+
+### Cold starts (Ollama)
+
+You never have to start Ollama yourself. The hook handles the whole cold path
+without putting it on your critical path:
+
+1. **Server down** → `ollama serve` is spawned detached (cooldown-guarded, so a
+   missing binary or a crash-looping daemon isn't relaunched on every prompt).
+2. **Server up, model not resident** (checked via `/api/ps`) → a detached
+   warm-up loads the model in the background with your `keep_alive`, and
+   coaching is skipped for *that one prompt*.
+3. **Model resident** → the analysis runs normally, in seconds.
+
+The prompt that starts the load says so once (via the display-only
+`systemMessage` channel the agent never sees), so a cold start explains itself
+instead of silently eating coaching. Later prompts during the same load stay
+quiet. From then on every prompt is coached — with the multi-GB load paid
+exactly once, in the background.
+
+This matters because the alternative is bad: a request against a cold model
+forces a synchronous weight load inside `COACH_TIMEOUT`. When the budget runs
+out the hook gives up, but **the server keeps loading**, and the next prompt
+stacks another request on top. A few of those in a row and the machine is
+pinned at full load, hot, with no coaching to show for it. Two locks prevent
+the pile-up: one so only a single warm-up runs at a time, one so only a single
+analysis is ever in flight. The warm-up lock is released by the warm-up itself
+the moment the load succeeds, so it tracks the real load duration rather than a
+guessed one; its TTL is only a backstop, so a killed hook can't wedge coaching
+permanently.
+
+Set `COACH_OLLAMA_REQUIRE_LOADED=off` to restore the old, blocking behavior.
 
 ### Dependencies (the API backends are the only ones with extras)
 

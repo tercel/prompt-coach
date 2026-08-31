@@ -9,8 +9,10 @@ or  python3 tests/test_coach.py
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1028,6 +1030,352 @@ def make_analysis_text():
             "prompt": {"has_issues": False, "improved": "", "guidance": ""},
         }
     )
+
+
+class TestOllamaAutostart(unittest.TestCase):
+    def _env(self, tmpdir, **extra):
+        env = {"PATH": "", "COACH_STATE_DIR": tmpdir}
+        env.update(extra)
+        return env
+
+    def test_ollama_alive_true_on_success(self):
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__ = mock.Mock(return_value=mock.Mock())
+            m.return_value.__exit__ = mock.Mock(return_value=False)
+            self.assertTrue(coach._ollama_alive("http://localhost:11434"))
+
+    def test_ollama_alive_false_on_error(self):
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            self.assertFalse(coach._ollama_alive("http://localhost:11434"))
+
+    def test_autostart_default_on(self):
+        # On by default so a user who picked the ollama backend never has to
+        # start the server themselves; the spawn is cooldown-guarded and a
+        # healthy server is never touched.
+        cfg = coach.load_config({"PATH": ""})
+        self.assertTrue(cfg["ollama_autostart"])
+
+    def test_autostart_respects_explicit_off(self):
+        cfg = coach.load_config({"PATH": "", "COACH_OLLAMA_AUTOSTART": "off"})
+        self.assertFalse(cfg["ollama_autostart"])
+
+    def test_autostart_defaults(self):
+        cfg = coach.load_config({"PATH": ""})
+        self.assertEqual(cfg["ollama_autostart_wait"], 8.0)
+        self.assertEqual(cfg["ollama_autostart_cooldown"], 60.0)
+
+    def test_autostart_skips_spawn_when_already_alive(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_OLLAMA_AUTOSTART="on"))
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch("subprocess.Popen") as popen:
+                self.assertTrue(coach._autostart_ollama(cfg, self._env(d)))
+                popen.assert_not_called()
+
+    def test_autostart_skips_spawn_without_binary(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(d, COACH_OLLAMA_AUTOSTART="on"))
+            self.assertEqual(cfg["ollama_bin"], "")  # PATH="" -> not found
+            with mock.patch.object(coach, "_ollama_alive", return_value=False), \
+                    mock.patch("subprocess.Popen") as popen:
+                self.assertFalse(coach._autostart_ollama(cfg, self._env(d)))
+                popen.assert_not_called()
+
+    def test_autostart_spawns_and_waits_for_liveness(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(
+                d, COACH_OLLAMA_AUTOSTART="on", COACH_OLLAMA_BIN="/usr/local/bin/ollama"
+            ))
+            # Down at the initial check, up on the first poll — no real sleeping.
+            with mock.patch.object(coach, "_ollama_alive", side_effect=[False, True]), \
+                    mock.patch("subprocess.Popen") as popen, \
+                    mock.patch("time.sleep"):
+                self.assertTrue(coach._autostart_ollama(cfg, self._env(d)))
+            self.assertEqual(popen.call_args.args[0], ["/usr/local/bin/ollama", "serve"])
+            self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+
+    def test_autostart_gives_up_after_wait_deadline(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(
+                d, COACH_OLLAMA_AUTOSTART="on", COACH_OLLAMA_BIN="/usr/local/bin/ollama",
+                COACH_OLLAMA_AUTOSTART_WAIT="0",
+            ))
+            with mock.patch.object(coach, "_ollama_alive", return_value=False), \
+                    mock.patch("subprocess.Popen"), \
+                    mock.patch("time.sleep"):
+                self.assertFalse(coach._autostart_ollama(cfg, self._env(d)))
+
+    def test_autostart_respects_cooldown_after_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config(self._env(
+                d, COACH_OLLAMA_AUTOSTART="on", COACH_OLLAMA_BIN="/usr/local/bin/ollama",
+                COACH_OLLAMA_AUTOSTART_WAIT="0",
+            ))
+            with mock.patch.object(coach, "_ollama_alive", return_value=False), \
+                    mock.patch("subprocess.Popen") as popen, \
+                    mock.patch("time.sleep"):
+                coach._autostart_ollama(cfg, self._env(d))   # first attempt: spawns once
+                popen.reset_mock()
+                coach._autostart_ollama(cfg, self._env(d))   # immediately again: on cooldown
+                popen.assert_not_called()
+
+    def test_analyze_ollama_autostarts_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_off = coach.load_config(self._env(d, COACH_OLLAMA_AUTOSTART="off"))
+            cfg_on = coach.load_config(self._env(d, COACH_OLLAMA_AUTOSTART="on"))
+            # Server down: the "off" config must not even try to spawn one.
+            with mock.patch.object(coach, "_ollama_alive", return_value=False), \
+                    mock.patch.object(coach, "_autostart_ollama") as autostart:
+                with self.assertRaises(coach.OllamaNotReady):
+                    coach._analyze_ollama("hi", cfg_off, "")
+                autostart.assert_not_called()
+
+                autostart.return_value = False
+                with self.assertRaises(coach.OllamaNotReady):
+                    coach._analyze_ollama("hi", cfg_on, "")
+                autostart.assert_called_once()
+
+
+class TestOllamaReadiness(unittest.TestCase):
+    """The gate that keeps a cold model off the hook's critical path."""
+
+    def _env(self, tmpdir):
+        return {"PATH": "", "COACH_STATE_DIR": tmpdir}
+
+    def _cfg(self, tmpdir, **extra):
+        env = self._env(tmpdir)
+        env.update(extra)
+        return coach.load_config(env)
+
+    def _ps_response(self, payload):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode()
+
+        return _Resp()
+
+    def test_require_loaded_defaults_on(self):
+        cfg = coach.load_config({"PATH": ""})
+        self.assertTrue(cfg["ollama_require_loaded"])
+        self.assertEqual(cfg["ollama_warm_ttl"], 900.0)
+
+    def test_model_resident_matches_exact_name(self):
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=self._ps_response({"models": [{"model": "qwen3:8b"}]}),
+        ):
+            self.assertTrue(coach._ollama_model_resident("http://h", "qwen3:8b"))
+
+    def test_model_resident_normalizes_latest_tag(self):
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=self._ps_response({"models": [{"model": "llama3.1:latest"}]}),
+        ):
+            self.assertTrue(coach._ollama_model_resident("http://h", "llama3.1"))
+
+    def test_model_not_resident_when_absent(self):
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=self._ps_response({"models": [{"model": "other:8b"}]}),
+        ):
+            self.assertFalse(coach._ollama_model_resident("http://h", "qwen3:8b"))
+
+    def test_model_resident_assumed_when_probe_unavailable(self):
+        # An old server without /api/ps must not permanently disable coaching.
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("404")):
+            self.assertTrue(coach._ollama_model_resident("http://h", "qwen3:8b"))
+
+    def test_cold_model_warms_in_background_and_skips_this_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch.object(coach, "_ollama_model_resident", return_value=False), \
+                    mock.patch("subprocess.Popen") as popen:
+                with self.assertRaises(coach.OllamaNotReady):
+                    coach._ensure_ollama_ready(cfg, self._env(d))
+                popen.assert_called_once()
+                self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+
+    def test_concurrent_prompts_spawn_only_one_warmup(self):
+        # The pile-up that pinned the CPU: every prompt kicking its own load.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch.object(coach, "_ollama_model_resident", return_value=False), \
+                    mock.patch("subprocess.Popen") as popen:
+                for _ in range(5):
+                    with self.assertRaises(coach.OllamaNotReady):
+                        coach._ensure_ollama_ready(cfg, self._env(d))
+                popen.assert_called_once()
+
+    def test_resident_model_passes_through_and_clears_warm_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            coach._mark(self._env(d), ".ollama_warm.lock")
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch.object(coach, "_ollama_model_resident", return_value=True), \
+                    mock.patch("subprocess.Popen") as popen:
+                coach._ensure_ollama_ready(cfg, self._env(d))
+                popen.assert_not_called()
+            self.assertFalse(
+                os.path.exists(os.path.join(d, ".ollama_warm.lock"))
+            )
+
+    def test_cold_start_notice_is_emitted_once_per_warmup(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch.object(coach, "_ollama_model_resident", return_value=False), \
+                    mock.patch("subprocess.Popen"):
+                # The prompt that starts the load explains itself...
+                with self.assertRaises(coach.OllamaNotReady) as first:
+                    coach._ensure_ollama_ready(cfg, self._env(d))
+                self.assertIn("loading local model", first.exception.notice or "")
+                # ...every later prompt during that same load stays quiet.
+                for _ in range(3):
+                    with self.assertRaises(coach.OllamaNotReady) as again:
+                        coach._ensure_ollama_ready(cfg, self._env(d))
+                    self.assertIsNone(again.exception.notice)
+
+    def test_server_down_carries_no_notice(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d, COACH_OLLAMA_AUTOSTART="off")
+            with mock.patch.object(coach, "_ollama_alive", return_value=False):
+                with self.assertRaises(coach.OllamaNotReady) as ctx:
+                    coach._ensure_ollama_ready(cfg, self._env(d))
+                self.assertIsNone(ctx.exception.notice)
+
+    def _run_warm_snippet(self, host, lock):
+        return subprocess.call([
+            sys.executable, "-c", coach._WARM_SNIPPET,
+            host, "some-model", "30m", "10", lock,
+        ])
+
+    def test_warmup_releases_the_lock_on_success(self):
+        # The lock tracks the REAL load duration, so WARM_TTL never has to be
+        # tuned to disk speed — it's only a backstop for a killed warm-up.
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, format, *args):  # noqa: A002  (base-class signature)
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                lock = os.path.join(d, ".ollama_warm.lock")
+                open(lock, "w").close()
+                rc = self._run_warm_snippet(
+                    "http://127.0.0.1:%d" % srv.server_address[1], lock
+                )
+                self.assertEqual(rc, 0)
+                self.assertFalse(
+                    os.path.exists(lock), "successful warm-up must release the lock"
+                )
+        finally:
+            srv.shutdown()
+
+    def test_warmup_keeps_the_lock_when_the_load_fails(self):
+        # A model that isn't pulled must not respawn a warm-up on every prompt;
+        # the retained lock turns WARM_TTL into the retry interval for that case.
+        with tempfile.TemporaryDirectory() as d:
+            lock = os.path.join(d, ".ollama_warm.lock")
+            open(lock, "w").close()
+            rc = self._run_warm_snippet("http://127.0.0.1:1", lock)  # nothing listening
+            self.assertEqual(rc, 1)
+            self.assertTrue(os.path.exists(lock))
+
+    def test_require_loaded_off_skips_the_ps_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d, COACH_OLLAMA_REQUIRE_LOADED="off")
+            with mock.patch.object(coach, "_ollama_alive", return_value=True), \
+                    mock.patch.object(coach, "_ollama_model_resident") as resident:
+                coach._ensure_ollama_ready(cfg, self._env(d))
+                resident.assert_not_called()
+
+
+class TestCrossProcessLock(unittest.TestCase):
+    def test_lock_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+            self.assertFalse(coach._acquire_lock(env, ".x.lock", 60.0))
+
+    def test_lock_is_reacquirable_after_release(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+            coach._clear_mark(env, ".x.lock")
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+
+    def test_stale_lock_is_stolen(self):
+        # A hook killed mid-analysis must not disable coaching forever.
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+            path = os.path.join(d, ".x.lock")
+            os.utime(path, (time.time() - 3600, time.time() - 3600))
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+
+    def test_inference_lock_blocks_a_second_analysis(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            with mock.patch.dict(os.environ, {"COACH_STATE_DIR": d}), \
+                    mock.patch.object(coach, "_ensure_ollama_ready"):
+                self.assertTrue(
+                    coach._acquire_lock(os.environ, ".ollama_infer.lock", 90.0)
+                )
+                with self.assertRaises(coach.OllamaNotReady):
+                    coach._analyze_ollama("hi", cfg, "")
+
+    def test_inference_lock_is_released_after_a_call(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"message": {"content": make_analysis_text()}}
+                ).encode()
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            with mock.patch.dict(os.environ, {"COACH_STATE_DIR": d}), \
+                    mock.patch.object(coach, "_ensure_ollama_ready"), \
+                    mock.patch("urllib.request.urlopen", return_value=_Resp()):
+                coach._analyze_ollama("hi", cfg, "")
+                # Lock released -> a later prompt can analyze again.
+                coach._analyze_ollama("hi", cfg, "")
+
+    def test_inference_lock_is_released_when_the_call_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            with mock.patch.dict(os.environ, {"COACH_STATE_DIR": d}), \
+                    mock.patch.object(coach, "_ensure_ollama_ready"), \
+                    mock.patch("urllib.request.urlopen", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    coach._analyze_ollama("hi", cfg, "")
+            self.assertFalse(
+                os.path.exists(os.path.join(d, ".ollama_infer.lock"))
+            )
 
 
 class TestDetectNativeLanguage(unittest.TestCase):

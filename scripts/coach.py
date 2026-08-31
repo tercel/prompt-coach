@@ -62,6 +62,32 @@ Configuration (environment variables):
                            qwen2.5-coder:32b-instruct-q4_K_M)
   COACH_OLLAMA_KEEP_ALIVE  how long Ollama keeps the model resident between calls
                            (default: 30m) — avoids repeated cold model-loads
+  COACH_OLLAMA_AUTOSTART   on/off (default on) — if the "ollama" backend can't
+                           reach COACH_OLLAMA_HOST, spawn `ollama serve` in the
+                           background and wait briefly for it to come up. A
+                           healthy server is never touched (one cheap liveness
+                           probe per call, no spawn), and a cooldown file stops
+                           a missing binary / crash-looping daemon from being
+                           relaunched on every prompt.
+  COACH_OLLAMA_BIN         path to the `ollama` binary for autostart (default:
+                           found on PATH)
+  COACH_OLLAMA_AUTOSTART_WAIT      seconds to wait for the spawned server to
+                           become reachable before giving up on THIS call
+                           (default: 8) — a slow/failed start still falls back
+                           to the normal swallowed-error behavior.
+  COACH_OLLAMA_AUTOSTART_COOLDOWN  minimum seconds between autostart attempts
+                           (default: 60)
+  COACH_OLLAMA_REQUIRE_LOADED  on/off (default on) — before analyzing, check
+                           `/api/ps` that the model is already resident. If it
+                           isn't, hand the cold load to a detached background
+                           warm-up and skip coaching for THIS prompt instead of
+                           cold-loading a multi-GB model inside COACH_TIMEOUT.
+                           Turning this off restores the old behavior, where a
+                           cold model made every prompt a long, CPU-pinning
+                           request that usually timed out anyway.
+  COACH_OLLAMA_WARM_TTL    seconds a background warm-up may run before its lock
+                           is treated as stale (default: 900) — a big model on
+                           a slow disk can legitimately take minutes to load.
   Coaching features — each independent on/off, overridden live by `/prompt-coach:*`.
   ALL default OFF (opt-in): a freshly-installed plugin does nothing until you turn
   a feature on (and when all are off the hook exits before any model call).
@@ -122,6 +148,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 # ---------------------------------------------------------------------------
 # Analysis contract (structured output schema enforced by both backends)
@@ -746,6 +773,16 @@ def load_config(env):
         "ollama_keep_alive": (
             gconf.get("ollama_keep_alive") or env.get("COACH_OLLAMA_KEEP_ALIVE") or "30m"
         ).strip(),
+        "ollama_autostart": _flag(env.get("COACH_OLLAMA_AUTOSTART", "on")),
+        "ollama_bin": (
+            env.get("COACH_OLLAMA_BIN") or shutil.which("ollama", path=env.get("PATH")) or ""
+        ),
+        "ollama_autostart_wait": _to_float(env.get("COACH_OLLAMA_AUTOSTART_WAIT"), 8.0),
+        "ollama_autostart_cooldown": _to_float(
+            env.get("COACH_OLLAMA_AUTOSTART_COOLDOWN"), 60.0
+        ),
+        "ollama_require_loaded": _flag(env.get("COACH_OLLAMA_REQUIRE_LOADED", "on")),
+        "ollama_warm_ttl": _to_float(env.get("COACH_OLLAMA_WARM_TTL"), 900.0),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
         "lang_mode": lang_mode,
         "min_chars": min_chars,
@@ -1269,6 +1306,272 @@ def _analyze_anthropic_api(prompt, cfg, context=""):
     return parse_analysis_text(json.dumps(getattr(tool_block, "input")))
 
 
+class OllamaNotReady(RuntimeError):
+    """The local Ollama server/model isn't usable yet — skip coaching this turn.
+
+    Raised instead of issuing a doomed request. `main` swallows every analysis
+    error, so this degrades to "no coaching for this prompt" while a background
+    warm-up brings the model up for the next one.
+
+    `notice` carries a one-line message to show the user via `systemMessage`.
+    It is set only on the prompt that actually kicks off a warm-up, so a cold
+    start explains itself exactly once instead of silently eating coaching.
+    """
+
+    def __init__(self, message, notice=None):
+        super().__init__(message)
+        self.notice = notice
+
+
+def _ollama_alive(host, timeout=1.0):
+    """Cheap liveness probe for a local Ollama server. No side effects."""
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(host + "/api/version", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _ollama_model_resident(host, model, timeout=1.0):
+    """True if `model` is already loaded in the server's memory (`/api/ps`).
+
+    This is the gate that keeps the machine cool. A request against a
+    NOT-resident model forces a synchronous cold load of the whole weight file
+    inside the hook's timeout budget; when that budget runs out the client
+    disconnects but the server keeps loading, and the next prompt stacks
+    another request on top. Checking residency first lets us hand the load off
+    to a detached warm-up instead of paying for it on the critical path.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(host + "/api/ps", timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        # Old server without /api/ps, or a transient blip: don't block coaching
+        # on a probe we can't trust — fall through to the normal request path.
+        return True
+    entries = payload.get("models")
+    if not isinstance(entries, list):
+        return True
+    wanted = _normalize_model_tag(model)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for key in ("model", "name"):
+            if _normalize_model_tag(entry.get(key) or "") == wanted:
+                return True
+    return False
+
+
+def _normalize_model_tag(tag):
+    """`qwen3:latest` and `qwen3` name the same model to Ollama; so treat them."""
+    tag = (tag or "").strip()
+    if tag.endswith(":latest"):
+        tag = tag[: -len(":latest")]
+    return tag
+
+
+def _marker_path(env, name):
+    return os.path.join(_state_base_dir(env), name)
+
+
+def _on_cooldown(env, name, cooldown_secs):
+    """True if `name` was marked too recently to retry.
+
+    Each hook invocation is a fresh, short-lived process, so "don't retry too
+    often" can't live in memory — it has to persist to disk. This is what
+    stops a missing `ollama` binary or a crash-looping daemon from getting a
+    fresh `ollama serve` spawn attempt on every single prompt.
+    """
+    try:
+        age = time.time() - os.path.getmtime(_marker_path(env, name))
+        return age < cooldown_secs
+    except OSError:
+        return False
+
+
+def _mark(env, name):
+    path = _marker_path(env, name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _clear_mark(env, name):
+    try:
+        os.remove(_marker_path(env, name))
+    except OSError:
+        pass
+
+
+def _acquire_lock(env, name, ttl_secs):
+    """Take a cross-process lock file, stealing it once it goes stale.
+
+    O_EXCL makes creation atomic, so concurrent hook processes (several Claude
+    Code sessions, or a fast double-send) can't both decide they're the one
+    doing the work. `ttl_secs` bounds a lock orphaned by a killed process.
+    """
+    path = _marker_path(env, name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        return False
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            if time.time() - os.path.getmtime(path) < ttl_secs:
+                return False
+            os.remove(path)  # stale — the holder died without releasing
+        except OSError:
+            return False
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except OSError:
+            return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return True
+
+
+def _autostart_ollama(cfg, env):
+    """Best-effort background start of `ollama serve` if unreachable.
+
+    Only spawns when the liveness probe actually fails — a healthy server is
+    never touched, so the common case (already running) costs one fast local
+    HTTP round-trip per prompt, not a process spawn. `start_new_session` (like
+    a shell's `setsid`) detaches the daemon from this short-lived hook process
+    so it keeps running after the hook exits.
+    """
+    import subprocess
+
+    if _ollama_alive(cfg["ollama_host"]):
+        return True
+    if _on_cooldown(env, ".ollama_autostart_ts", cfg["ollama_autostart_cooldown"]):
+        return False
+    _mark(env, ".ollama_autostart_ts")
+    if not cfg["ollama_bin"]:
+        return False
+    try:
+        subprocess.Popen(
+            [cfg["ollama_bin"], "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    deadline = time.time() + cfg["ollama_autostart_wait"]
+    while time.time() < deadline:
+        if _ollama_alive(cfg["ollama_host"], timeout=0.5):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# Loads the model into the server's memory and exits. `/api/generate` with an
+# empty prompt is Ollama's documented load-only call: it returns as soon as the
+# weights are resident, without generating a single token.
+#
+# The lock is released HERE, and only on success. That makes the lock track the
+# real load — however long it takes — instead of a guessed duration, so
+# COACH_OLLAMA_WARM_TTL is only ever a backstop for a killed warm-up, never a
+# value anyone has to tune to their disk speed. On failure the lock is
+# deliberately left in place: a model that isn't pulled would otherwise get a
+# fresh warm-up spawned on every single prompt, and the TTL becomes the retry
+# interval for exactly that case.
+_WARM_SNIPPET = (
+    "import json,os,sys,urllib.request\n"
+    "host,model,keep,timeout,lock=sys.argv[1:6]\n"
+    "body=json.dumps({'model':model,'prompt':'','keep_alive':keep}).encode('utf-8')\n"
+    "req=urllib.request.Request(host+'/api/generate',data=body,"
+    "headers={'Content-Type':'application/json'},method='POST')\n"
+    "try:\n"
+    "    urllib.request.urlopen(req,timeout=float(timeout)).read()\n"
+    "except Exception:\n"
+    "    sys.exit(1)\n"
+    "try:\n"
+    "    os.remove(lock)\n"
+    "except OSError:\n"
+    "    pass\n"
+)
+
+
+def _warm_ollama_async(cfg, env):
+    """Kick off a detached, non-blocking model load. Returns True if spawned.
+
+    The load runs in its own session so it survives this hook process exiting,
+    and a TTL lock means a second prompt arriving mid-load does NOT spawn a
+    competing load — which is exactly the pile-up that pinned the CPU before.
+    The lock is only released once the model shows up as resident.
+    """
+    import subprocess
+
+    if not _acquire_lock(env, ".ollama_warm.lock", cfg["ollama_warm_ttl"]):
+        return False
+    try:
+        subprocess.Popen(
+            [
+                sys.executable, "-c", _WARM_SNIPPET,
+                cfg["ollama_host"], cfg["ollama_model"],
+                cfg["ollama_keep_alive"], str(cfg["ollama_warm_ttl"]),
+                _marker_path(env, ".ollama_warm.lock"),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        _clear_mark(env, ".ollama_warm.lock")
+        return False
+    return True
+
+
+def _ensure_ollama_ready(cfg, env):
+    """Gate the analysis call on a live server holding a resident model.
+
+    Raises OllamaNotReady (silently skipping coaching for this prompt) rather
+    than issuing a request that would cold-load the model on the critical path.
+    """
+    if not _ollama_alive(cfg["ollama_host"]):
+        started = cfg["ollama_autostart"] and _autostart_ollama(cfg, env)
+        if not started:
+            raise OllamaNotReady("ollama server unreachable at %s" % cfg["ollama_host"])
+
+    if not cfg["ollama_require_loaded"]:
+        return
+    if _ollama_model_resident(cfg["ollama_host"], cfg["ollama_model"]):
+        # Resident now — whoever held the warm-up lock is done with it.
+        _clear_mark(env, ".ollama_warm.lock")
+        return
+    # Only the prompt that actually starts the load explains itself; the lock
+    # makes that exactly one prompt per cold start, not one per prompt.
+    spawned = _warm_ollama_async(cfg, env)
+    raise OllamaNotReady(
+        "ollama model %r not resident; warming up in the background"
+        % cfg["ollama_model"],
+        notice=(
+            "Prompt Coach: loading local model %s in the background. "
+            "Coaching resumes automatically once it's resident "
+            "(this happens once per cold start)." % cfg["ollama_model"]
+        ) if spawned else None,
+    )
+
+
 def _analyze_ollama(prompt, cfg, context=""):
     """Run analysis through a local Ollama server (native /api/chat).
 
@@ -1296,6 +1599,17 @@ def _analyze_ollama(prompt, cfg, context=""):
     """
     import urllib.request
 
+    # Never issue a request that would cold-load the model inline: that's what
+    # made every prompt a multi-minute CPU burn when the server wasn't already
+    # warm. This either returns fast against a resident model or raises.
+    _ensure_ollama_ready(cfg, os.environ)
+
+    # One in-flight analysis at a time. Without this, a prompt sent while the
+    # previous analysis is still running stacks a second inference on the same
+    # machine; a few of those in a row is the "computer gets very hot" symptom.
+    if not _acquire_lock(os.environ, ".ollama_infer.lock", cfg["timeout"] + 30.0):
+        raise OllamaNotReady("another prompt-coach analysis is already in flight")
+
     body = json.dumps({
         "model": cfg["ollama_model"],
         "stream": False,
@@ -1316,8 +1630,11 @@ def _analyze_ollama(prompt, cfg, context=""):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
-        envelope = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+            envelope = json.loads(resp.read().decode("utf-8"))
+    finally:
+        _clear_mark(os.environ, ".ollama_infer.lock")
     content = (envelope.get("message") or {}).get("content", "")
     return parse_analysis_text(extract_json_text(content))
 
@@ -1710,6 +2027,14 @@ def main():
 
     try:
         analysis = analyze(prompt_for_model, cfg, context)
+    except OllamaNotReady as exc:
+        # Not an error: the local model just isn't up yet. Say so once (via the
+        # display-only channel the agent never sees), then step aside.
+        if cfg["debug"]:
+            sys.stderr.write("prompt-coach error: %r\n" % (exc,))
+        if exc.notice:
+            sys.stdout.write(json.dumps({"systemMessage": exc.notice}))
+        sys.exit(0)
     except Exception as exc:  # never break the user's workflow
         if cfg["debug"]:
             sys.stderr.write("prompt-coach error: %r\n" % (exc,))

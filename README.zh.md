@@ -105,6 +105,12 @@ Codex 插件入口为 `.codex-plugin/plugin.json`，其中 `"hooks": "./hooks/ho
 | `COACH_OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务器基础 URL（`ollama` 后端）。 |
 | `COACH_OLLAMA_MODEL` | `llama3.1` | Ollama 模型（`ollama` 后端）。推荐高质量 instruct 模型，如 `qwen2.5-coder:32b-instruct-q4_K_M`。 |
 | `COACH_OLLAMA_KEEP_ALIVE` | `30m` | Ollama 在两次调用之间保持模型驻留的时长（避免断续使用时的冷启动延迟）。 |
+| `COACH_OLLAMA_AUTOSTART` | `on` | 若 `ollama` 后端连不上 `COACH_OLLAMA_HOST`，在后台拉起 `ollama serve` 并短暂等待其就绪。服务健康时完全不会碰它（每次调用只做一次轻量存活探测，不会 spawn 进程）；一个冷却标记文件会阻止二进制缺失或反复崩溃的守护进程在每条 prompt 上都被重新拉起。 |
+| `COACH_OLLAMA_BIN` | `PATH` 中查找 | `ollama` 可执行文件路径，供自动启动使用。 |
+| `COACH_OLLAMA_AUTOSTART_WAIT` | `8` | 等待新拉起的服务变为可达的秒数，超时则本次调用照常按现有的“吞掉错误”逻辑处理。 |
+| `COACH_OLLAMA_AUTOSTART_COOLDOWN` | `60` | 两次自动启动尝试之间的最小间隔秒数。 |
+| `COACH_OLLAMA_REQUIRE_LOADED` | `on` | 分析前先通过 `/api/ps` 确认模型已驻留内存。若未驻留，把冷加载交给后台预热进程，并跳过**这一条** prompt 的辅导。见[冷启动](#冷启动ollama)。 |
+| `COACH_OLLAMA_WARM_TTL` | `900` | 仅作兜底。预热进程在加载成功的瞬间自行释放锁，因此这个值**不需要**按磁盘速度调整——它只用于约束被杀掉的预热，并充当「模型根本加载不了」时的重试间隔。 |
 | `COACH_TARGET_LANG` | `English` | 正在练习的语言。 |
 | `COACH_NATIVE_LANG` | locale 检测 | 用于说明的语言。 |
 | `COACH_LEVEL` | `Advanced` | 反馈深度。 |
@@ -133,6 +139,20 @@ COACH_BACKEND=ollama    # 强制使用本地 Ollama 服务器（COACH_OLLAMA_HOS
 ```
 
 若 `COACH_NATIVE_LANG` 与 `COACH_TARGET_LANG` 相同，则只运行 prompt 质量辅导。
+
+### 冷启动（Ollama）
+
+你**不需要**自己先把 Ollama 跑起来。hook 会自己处理整条冷启动路径，并且不把它压在关键路径上：
+
+1. **服务未启动** → 以分离进程方式拉起 `ollama serve`（带冷却保护，二进制缺失或守护进程反复崩溃时不会每条 prompt 都重试）。
+2. **服务已启动、但模型未驻留**（通过 `/api/ps` 判断）→ 由一个分离的预热进程在后台按你的 `keep_alive` 加载模型，并跳过**这一条** prompt 的辅导。
+3. **模型已驻留** → 正常分析，秒级返回。
+
+触发加载的那条 prompt 会提示一次（走 `systemMessage` 这个只给人看、agent 看不到的通道），因此冷启动会自我说明，而不是静默吞掉辅导；同一次加载期间的后续 prompt 保持安静。之后每条 prompt 都有辅导，而几个 GB 的模型加载只在后台付费一次。
+
+这件事很关键，因为另一种做法很糟：对着冷模型发请求，会在 `COACH_TIMEOUT` 之内同步触发权重加载。预算耗尽后 hook 放弃了，**但服务端仍在继续加载**，下一条 prompt 又叠上来一个新请求。这样连续几次，机器就会被压满、持续发热，而你一条辅导也没拿到。两把锁阻止了这种堆叠：一把保证同一时刻只有一个预热在跑，一把保证同一时刻只有一次分析在飞。预热锁由预热进程在加载成功的瞬间自行释放，因此它跟踪的是真实加载耗时；TTL 只是兜底，被杀掉的 hook 不会把辅导永久卡死。
+
+设置 `COACH_OLLAMA_REQUIRE_LOADED=off` 可恢复旧的阻塞式行为。
 
 ### 依赖说明（仅 API 后端需要额外安装）
 
