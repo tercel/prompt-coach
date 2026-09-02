@@ -1332,6 +1332,99 @@ class TestCrossProcessLock(unittest.TestCase):
             os.utime(path, (time.time() - 3600, time.time() - 3600))
             self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
 
+    def test_dead_holder_lock_is_stolen_when_pid_aware(self):
+        # The regression that made the ollama backend look dead: the host kills
+        # a hook that overruns its 30s budget, the release never runs, and every
+        # prompt for the rest of the TTL is silently skipped.
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 600.0))
+            with open(os.path.join(d, ".x.lock"), "w", encoding="ascii") as fh:
+                fh.write("999999")          # a PID that is not running
+            self.assertFalse(coach._acquire_lock(env, ".x.lock", 600.0))
+            self.assertTrue(
+                coach._acquire_lock(env, ".x.lock", 600.0, pid_aware=True)
+            )
+
+    def test_live_holder_lock_is_kept_when_pid_aware(self):
+        # pid_aware must not weaken the mutual exclusion it exists to preserve.
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 600.0))
+            self.assertFalse(
+                coach._acquire_lock(env, ".x.lock", 600.0, pid_aware=True)
+            )
+
+    def test_unreadable_holder_pid_is_treated_as_dead_when_pid_aware(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            path = os.path.join(d, ".x.lock")
+            with open(path, "w", encoding="ascii") as fh:
+                fh.write("not-a-pid")
+            self.assertTrue(
+                coach._acquire_lock(env, ".x.lock", 600.0, pid_aware=True)
+            )
+
+    def test_warm_lock_ttl_survives_its_dead_spawner(self):
+        # The warm-up lock is deliberately NOT pid_aware: it is written by the
+        # short-lived hook, released by a detached loader, and on failure its
+        # TTL is the retry interval. Stealing it on a dead PID would respawn a
+        # doomed multi-GB load on every prompt.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            env = {"COACH_STATE_DIR": d}
+            self.assertTrue(
+                coach._acquire_lock(env, ".ollama_warm.lock", cfg["ollama_warm_ttl"])
+            )
+            with open(os.path.join(d, ".ollama_warm.lock"), "w", encoding="ascii") as fh:
+                fh.write("999999")
+            self.assertFalse(coach._warm_ollama_async(cfg, env))
+
+    def test_inference_lock_survives_a_stale_lock_from_a_killed_hook(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"message": {"content": make_analysis_text()}}
+                ).encode()
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})
+            path = os.path.join(d, ".ollama_infer.lock")
+            with open(path, "w", encoding="ascii") as fh:
+                fh.write("999999")          # killed hook, lock never released
+            with mock.patch.dict(os.environ, {"COACH_STATE_DIR": d}), \
+                    mock.patch.object(coach, "_ensure_ollama_ready"), \
+                    mock.patch("urllib.request.urlopen", return_value=_Resp()):
+                coach._analyze_ollama("hi", cfg, "")
+
+    def test_termination_guard_releases_the_lock_and_re_raises(self):
+        import signal
+
+        with tempfile.TemporaryDirectory() as d:
+            env = {"COACH_STATE_DIR": d}
+            path = os.path.join(d, ".x.lock")
+            self.assertTrue(coach._acquire_lock(env, ".x.lock", 60.0))
+            with self.assertRaises(KeyboardInterrupt):
+                with coach._released_on_termination(env, ".x.lock"):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    time.sleep(0.2)
+            self.assertFalse(os.path.exists(path))
+
+    def test_termination_guard_restores_previous_handlers(self):
+        import signal
+
+        original = signal.getsignal(signal.SIGTERM)
+        with tempfile.TemporaryDirectory() as d:
+            with coach._released_on_termination({"COACH_STATE_DIR": d}, ".x.lock"):
+                self.assertIsNot(signal.getsignal(signal.SIGTERM), original)
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
     def test_inference_lock_blocks_a_second_analysis(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = coach.load_config({"PATH": "", "COACH_STATE_DIR": d})

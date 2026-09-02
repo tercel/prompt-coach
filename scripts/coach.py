@@ -141,6 +141,7 @@ Design rule: this hook must NEVER break your workflow. Any error (missing
 backend, network failure, bad JSON) results in a clean exit 0 with no output.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -1410,12 +1411,44 @@ def _clear_mark(env, name):
         pass
 
 
-def _acquire_lock(env, name, ttl_secs):
+def _pid_alive(pid):
+    """True if `pid` names a live process. Unknown/garbage PIDs read as dead."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True         # alive, just not ours to signal
+    except OSError:
+        return True         # can't tell — assume alive, TTL still bounds it
+    return True
+
+
+def _lock_holder_pid(path):
+    """The PID recorded inside a lock file, or None if unreadable/not a PID."""
+    try:
+        with open(path, encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _acquire_lock(env, name, ttl_secs, pid_aware=False):
     """Take a cross-process lock file, stealing it once it goes stale.
 
     O_EXCL makes creation atomic, so concurrent hook processes (several Claude
     Code sessions, or a fast double-send) can't both decide they're the one
     doing the work. `ttl_secs` bounds a lock orphaned by a killed process.
+
+    `pid_aware` additionally steals a lock whose recorded holder is already
+    dead, without waiting out the TTL. The host kills a hook that overruns its
+    own (shorter) timeout, so a lock guarding work that lives and dies WITH the
+    hook process is routinely orphaned; waiting out its TTL would then silence
+    coaching for every prompt in that window. Only pass it for a lock that is
+    meaningless once its holder exits — NOT for one whose TTL is deliberately a
+    retry interval for detached work (the warm-up lock).
     """
     path = _marker_path(env, name)
     try:
@@ -1426,7 +1459,8 @@ def _acquire_lock(env, name, ttl_secs):
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         try:
-            if time.time() - os.path.getmtime(path) < ttl_secs:
+            fresh = time.time() - os.path.getmtime(path) < ttl_secs
+            if fresh and not (pid_aware and not _pid_alive(_lock_holder_pid(path))):
                 return False
             os.remove(path)  # stale — the holder died without releasing
         except OSError:
@@ -1444,6 +1478,45 @@ def _acquire_lock(env, name, ttl_secs):
     finally:
         os.close(fd)
     return True
+
+
+@contextlib.contextmanager
+def _released_on_termination(env, name):
+    """Release lock `name` if the host terminates us while inside the block.
+
+    A UserPromptSubmit hook that overruns the host's own timeout is killed, so
+    the `finally` that normally releases the lock never runs. Handling SIGTERM
+    turns the common kill into a clean release; SIGKILL still can't be caught,
+    which is what the pid_aware steal in `_acquire_lock` is for. Signals can
+    only be installed on the main thread, so a failure to install is ignored —
+    the pid_aware steal remains the backstop either way.
+    """
+    import signal
+
+    previous = {}
+    def _handler(signum, frame):
+        _clear_mark(env, name)
+        # Restore and re-raise so we die exactly as the host intended, instead
+        # of turning a termination signal into a silently ignored one.
+        try:
+            signal.signal(signum, previous.get(signum, signal.SIG_DFL))
+            os.kill(os.getpid(), signum)
+        except (OSError, ValueError):
+            os._exit(1)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            previous[signum] = signal.signal(signum, _handler)
+        except (OSError, ValueError, AttributeError):
+            previous.pop(signum, None)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
 
 
 def _autostart_ollama(cfg, env):
@@ -1607,7 +1680,15 @@ def _analyze_ollama(prompt, cfg, context=""):
     # One in-flight analysis at a time. Without this, a prompt sent while the
     # previous analysis is still running stacks a second inference on the same
     # machine; a few of those in a row is the "computer gets very hot" symptom.
-    if not _acquire_lock(os.environ, ".ollama_infer.lock", cfg["timeout"] + 30.0):
+    #
+    # pid_aware because this lock guards work that dies with the hook process,
+    # and the host kills a hook that overruns ITS timeout (30s in hooks.json)
+    # well before COACH_TIMEOUT (60s) is up. A killed holder must not silence
+    # coaching for the rest of the TTL — the very failure that looks like
+    # "the ollama backend stopped working entirely".
+    if not _acquire_lock(
+        os.environ, ".ollama_infer.lock", cfg["timeout"] + 30.0, pid_aware=True
+    ):
         raise OllamaNotReady("another prompt-coach analysis is already in flight")
 
     body = json.dumps({
@@ -1630,11 +1711,14 @@ def _analyze_ollama(prompt, cfg, context=""):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
-            envelope = json.loads(resp.read().decode("utf-8"))
-    finally:
-        _clear_mark(os.environ, ".ollama_infer.lock")
+    # `finally` covers a normal error; the signal guard covers the host killing
+    # us mid-inference, which is how this lock actually gets orphaned.
+    with _released_on_termination(os.environ, ".ollama_infer.lock"):
+        try:
+            with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+                envelope = json.loads(resp.read().decode("utf-8"))
+        finally:
+            _clear_mark(os.environ, ".ollama_infer.lock")
     content = (envelope.get("message") or {}).get("content", "")
     return parse_analysis_text(extract_json_text(content))
 
