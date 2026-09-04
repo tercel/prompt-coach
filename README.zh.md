@@ -121,6 +121,7 @@ Codex 插件入口为 `.codex-plugin/plugin.json`，其中 `"hooks": "./hooks/ho
 | `COACH_STATE_DIR` | `~/.config/prompt-coach` | 运行时状态文件所在目录。 |
 | `COACH_CLI_FLAGS` | 未设置 | 传给 `codex exec` 的额外标志（Codex CLI 后端）。 |
 | `COACH_MODE` | `annotate` | `annotate` 或 `block`。 |
+| `COACH_ANNOTATE_CHANNEL` | `both` | `both`、`system` 或 `context` —— `annotate` 使用哪个通道。`system` 只能覆盖会渲染 `systemMessage` 的客户端（终端 CLI，桌面端 Code 标签页不行）；`context` 只走 agent 回显那条路径。无法识别的值回退为 `both`。 |
 | `COACH_MIN_PROMPT_CHARS` | `6` | 超短多词 prompt 的字符下限（见下方过滤说明）。 |
 | `COACH_CONTEXT_MESSAGES` | `6` | 用作上下文的近期对话轮次数。 |
 | `COACH_CONTEXT_CHARS` | `2000` | 最大渲染上下文字符数。 |
@@ -322,7 +323,7 @@ set = {
 
 ## 输出模式
 
-- **`annotate`**：将辅导内容以 `systemMessage` 直接显示在对话记录里。Agent 完全看不到这段内容，仍会照你原始的 prompt 正常回答。
+- **`annotate`**：同时走两个通道投递辅导内容，因为没有任何单一通道能覆盖所有客户端 —— 终端 CLI 会渲染 `systemMessage`，而 Claude 桌面端 Code 标签页不渲染它，只显示 agent 自己打印出来的内容。注入给 agent 的指令只要求它原样打印辅导块，然后照你**原始**的 prompt 正常回答；绝不会让它去回答改写后的版本。如果你只用能渲染 `systemMessage` 的客户端、不想看到两遍，用 `COACH_ANNOTATE_CHANNEL` 收窄。
 - **`block`**：以退出码 2 拒绝 prompt，要求重新提交。
 
 ## 本地试用

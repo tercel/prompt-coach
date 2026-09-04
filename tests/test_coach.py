@@ -711,14 +711,49 @@ class TestBuildDelivery(unittest.TestCase):
         out, err, code = coach.build_delivery(make_analysis(False, False), cfg)
         self.assertEqual((out, err, code), ("", "", 0))
 
-    def test_annotate_mode(self):
+    def test_annotate_mode_emits_both_channels(self):
+        # Neither channel alone reaches every client: the terminal CLI renders
+        # systemMessage, the desktop Code tab only shows what the agent echoes.
         cfg = coach.load_config({"OPENAI_API_KEY": "x"})  # default mode = annotate
         out, err, code = coach.build_delivery(make_analysis(), cfg)
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         payload = json.loads(out)
-        self.assertNotIn("hookSpecificOutput", payload)
         self.assertIn("Fix the 401 error in src/auth/login.ts", payload["systemMessage"])
+        injected = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(
+            payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit"
+        )
+        self.assertIn("Fix the 401 error in src/auth/login.ts", injected)
+        self.assertIn("VERBATIM", injected)
+
+    def test_annotate_never_injects_the_improved_prompt_as_the_request(self):
+        # The 0.12.5 regression: injecting "Answer this improved version..."
+        # made the agent answer a question the user never asked.
+        cfg = coach.load_config({"OPENAI_API_KEY": "x"})
+        out, _, _ = coach.build_delivery(make_analysis(), cfg)
+        injected = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("Answer this improved version", injected)
+        self.assertIn("ORIGINAL request unchanged", injected)
+
+    def test_annotate_channel_can_be_narrowed(self):
+        base = {"OPENAI_API_KEY": "x"}
+        only_system = coach.load_config({**base, "COACH_ANNOTATE_CHANNEL": "system"})
+        payload = json.loads(coach.build_delivery(make_analysis(), only_system)[0])
+        self.assertIn("systemMessage", payload)
+        self.assertNotIn("hookSpecificOutput", payload)
+
+        only_ctx = coach.load_config({**base, "COACH_ANNOTATE_CHANNEL": "context"})
+        payload = json.loads(coach.build_delivery(make_analysis(), only_ctx)[0])
+        self.assertNotIn("systemMessage", payload)
+        self.assertIn("hookSpecificOutput", payload)
+
+    def test_unknown_annotate_channel_falls_back_to_both(self):
+        # A typo must never be the reason coaching goes silent.
+        cfg = coach.load_config({"OPENAI_API_KEY": "x", "COACH_ANNOTATE_CHANNEL": "nope"})
+        payload = json.loads(coach.build_delivery(make_analysis(), cfg)[0])
+        self.assertIn("systemMessage", payload)
+        self.assertIn("hookSpecificOutput", payload)
 
     def test_block_mode(self):
         cfg = coach.load_config({"OPENAI_API_KEY": "x", "COACH_MODE": "block"})

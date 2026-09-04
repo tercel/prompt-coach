@@ -16,9 +16,12 @@ the same analysis logic is meant to be reused later behind a terminal split-pane
 or a floating panel.
 
 Delivery modes (env COACH_MODE):
-  - "annotate" (default): non-blocking. Shows the coaching as a systemMessage
-    directly in the transcript — the active coding agent never sees it and
-    keeps answering your original prompt unchanged.
+  - "annotate" (default): non-blocking. Emits the coaching on BOTH the
+    display-only systemMessage channel and, as an echo instruction, through
+    additionalContext — no single channel reaches every client (the terminal
+    CLI renders systemMessage; the Claude desktop Code tab does not). The agent
+    still answers your original prompt unchanged either way. Narrow it with
+    COACH_ANNOTATE_CHANNEL = both (default) | system | context.
   - "block": blocking. Surfaces the coaching and blocks the prompt so you
     consciously resubmit the improved version (a stricter learning loop).
 
@@ -677,6 +680,16 @@ def save_global_config(env, updates):
     return None
 
 
+def _annotate_channel(env):
+    """Which annotate-mode channel(s) to emit: "both" (default), "system", "context".
+
+    Unrecognized values fall back to "both" rather than silencing coaching: a
+    typo here must never be the reason nothing shows up.
+    """
+    value = (env.get("COACH_ANNOTATE_CHANNEL") or "both").strip().lower()
+    return value if value in ("both", "system", "context") else "both"
+
+
 def load_config(env):
     """Build a config dict from an environment-like mapping."""
     try:
@@ -785,6 +798,7 @@ def load_config(env):
         "ollama_require_loaded": _flag(env.get("COACH_OLLAMA_REQUIRE_LOADED", "on")),
         "ollama_warm_ttl": _to_float(env.get("COACH_OLLAMA_WARM_TTL"), 900.0),
         "mode": (env.get("COACH_MODE", "annotate") or "annotate").strip().lower(),
+        "annotate_channel": _annotate_channel(env),
         "lang_mode": lang_mode,
         "min_chars": min_chars,
         "context_messages": _to_int(env.get("COACH_CONTEXT_MESSAGES"), 6),
@@ -1058,6 +1072,30 @@ def format_coaching(analysis, cfg):
     return "\n".join(lines)
 
 
+def build_additional_context(analysis, cfg, block):
+    """Coaching injected into the agent's context so the agent echoes it.
+
+    This is a DISPLAY instruction, not a rewrite instruction. Up to 0.12.5 it
+    also appended "Answer this improved version of their request: ..." — which
+    made the agent answer a question the user never asked. 0.12.6 fixed that by
+    dropping the channel entirely, and visibility went with it: `systemMessage`
+    alone is rendered by the terminal CLI but NOT by the Claude desktop Code
+    tab, so coaching silently vanished there. Echoing through the agent is the
+    only delivery that reaches every client, so it comes back — without the
+    line that caused the trouble.
+    """
+    _ = analysis   # kept for signature stability; the improved prompt is NOT injected
+    return "\n".join([
+        "[prompt-coach] Coaching for the user, a %s speaker practicing %s (%s level)."
+        % (cfg["native"], cfg["target"], cfg["level"]),
+        "Display the coaching block below to the user VERBATIM at the very start "
+        "of your reply, then answer their ORIGINAL request unchanged. Do NOT "
+        "answer the improved prompt, and do NOT comment on the coaching.",
+        "",
+        block,
+    ])
+
+
 def build_delivery(analysis, cfg):
     """Return (stdout, stderr, exit_code) for the given analysis + config."""
     if not has_any_issues(analysis):
@@ -1068,10 +1106,23 @@ def build_delivery(analysis, cfg):
     if cfg["mode"] == "block":
         return ("", block + "\n", 2)
 
-    # annotate (default): display-only via systemMessage. The active agent
-    # never sees this field, so it keeps answering the user's original prompt
-    # unchanged — the coaching is purely for the human to read and act on.
-    payload = {"systemMessage": block}
+    # annotate (default): no single channel reaches every client, so use both.
+    #   systemMessage     — display-only, the agent never sees it. Rendered by
+    #                       the terminal CLI.
+    #   additionalContext — the agent echoes the block verbatim. The only thing
+    #                       that shows up in a client that ignores
+    #                       systemMessage (the Claude desktop Code tab).
+    # COACH_ANNOTATE_CHANNEL narrows this to one channel for anyone who only
+    # uses a client that renders systemMessage and doesn't want it twice.
+    channel = cfg["annotate_channel"]
+    payload = {}
+    if channel in ("both", "system"):
+        payload["systemMessage"] = block
+    if channel in ("both", "context"):
+        payload["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": build_additional_context(analysis, cfg, block),
+        }
     return (json.dumps(payload), "", 0)
 
 

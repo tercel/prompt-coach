@@ -152,6 +152,7 @@ In that case point the `command` at the working copy with an absolute path —
 | `COACH_STATE_DIR` | `~/.config/prompt-coach` | Directory for the runtime state file. |
 | `COACH_CLI_FLAGS` | unset | Extra space-separated flags for `codex exec` (Codex CLI backend). |
 | `COACH_MODE` | `annotate` | `annotate` or `block`. |
+| `COACH_ANNOTATE_CHANNEL` | `both` | `both`, `system` or `context` — which channel `annotate` uses. `system` only reaches clients that render `systemMessage` (the terminal CLI, not the desktop Code tab); `context` only reaches the agent-echo path. An unrecognized value falls back to `both`. |
 | `COACH_MIN_PROMPT_CHARS` | `6` | Floor for ultra-short multi-word prompts (see filtering below). |
 | `COACH_CONTEXT_MESSAGES` | `6` | Recent transcript turns used as context. |
 | `COACH_CONTEXT_CHARS` | `2000` | Maximum rendered context characters. |
@@ -441,9 +442,13 @@ machine-wide defaults can live in `~/.codex/config.toml` under
 
 ## Delivery modes
 
-- **`annotate`**: show the coaching as a `systemMessage` directly in the
-  transcript. The agent never sees it and keeps answering your original
-  prompt unchanged.
+- **`annotate`**: deliver the coaching on two channels at once, because no
+  single one reaches every client — the terminal CLI renders `systemMessage`,
+  while the Claude desktop Code tab ignores it and only shows what the agent
+  itself prints. The agent is asked to echo the coaching block verbatim and
+  then answer your **original** prompt unchanged; it is never told to answer
+  the improved version. Narrow this with `COACH_ANNOTATE_CHANNEL` if you only
+  use a client that renders `systemMessage` and don't want it twice.
 - **`block`**: reject the prompt with exit code 2 and require resubmission.
 
 ## Try locally
